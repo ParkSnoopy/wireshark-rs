@@ -325,6 +325,15 @@ kbd {
     box-shadow: var(--shadow-lg);
 }
 
+dialog.modal {
+    border: none;
+    color: var(--text);
+}
+
+dialog.modal::backdrop {
+    background: rgb(62 39 35 / 35%);
+}
+
 /* ---------- Inputs ---------- */
 
 .field {
@@ -485,8 +494,11 @@ kbd {
     cursor: pointer;
 }
 
+/* The inset shadow alone reads as unpressed on the wash; fill it too. */
 .chip-filter[aria-pressed="true"] {
+    background: var(--primary);
     box-shadow: var(--shadow-inset-mini);
+    color: var(--text-on-primary);
 }
 
 .chip-success {
@@ -880,6 +892,97 @@ body {
     text-align: right;
 }
 
+.filter-button {
+    white-space: nowrap;
+}
+
+.filter-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 20px;
+    height: 20px;
+    margin-left: 6px;
+    padding: 0 6px;
+    border-radius: var(--radius-full);
+    background: var(--primary);
+    color: var(--text-on-primary);
+    font: 500 11px / 1 var(--font-body);
+}
+
+/* ---------- Filter dialog ---------- */
+
+.filter-dialog {
+    width: min(640px, calc(100vw - 2 * var(--space-xl)));
+    max-height: calc(100vh - 2 * var(--space-xl));
+    padding: 0;
+    overflow: auto;
+}
+
+.filter-dialog-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+    padding: var(--space-lg);
+}
+
+.filter-dialog-head,
+.filter-dialog-foot {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+}
+
+.filter-dialog-head h3 {
+    flex: 1;
+    font: var(--type-h3);
+}
+
+.filter-dialog-foot {
+    padding-top: var(--space-md);
+    border-top: 1px solid var(--divider);
+}
+
+.filter-dialog-foot .filter-count {
+    flex: 1;
+    text-align: left;
+}
+
+.filter-group {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+    margin: 0;
+    padding: 0;
+    border: none;
+}
+
+.filter-group legend {
+    margin-bottom: var(--space-xs);
+    padding: 0;
+    font: 500 14px / 22px var(--font-body);
+}
+
+.filter-row {
+    display: grid;
+    grid-template-columns: 2fr 1fr 1fr;
+    gap: var(--space-md);
+}
+
+/* Room for the raised chip shadows. */
+.chip-set,
+.segmented {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-sm);
+    padding: 4px;
+}
+
+.chip-count {
+    font: 400 11px / 16px var(--font-mono);
+    opacity: 0.75;
+}
+
 .sheet {
     min-height: 0;
     overflow: hidden;
@@ -1123,14 +1226,20 @@ body {
     color: var(--primary);
 }
 
-/* Scope and interface after an address: plain muted text, no chip. */
+/* PTR name, scope and interface after an address: plain muted text, no
+   chip. Long names, here and in .addr-label, end in an ellipsis; the hover
+   card holds the full text. */
 .addr-tag {
+    display: inline-block;
+    max-width: 220px;
     margin-left: 6px;
+    overflow: hidden;
     color: var(--text-muted);
     font: var(--type-small);
+    text-overflow: ellipsis;
+    vertical-align: bottom;
 }
 
-/* Long host names end in an ellipsis; the title holds the full label. */
 .addr-label {
     display: inline-block;
     max-width: 300px;
@@ -1231,6 +1340,11 @@ body {
     background: var(--warning-bg);
     color: var(--warning-text);
     font-weight: 500;
+}
+
+.tip-hint {
+    color: var(--secondary);
+    font: var(--type-small);
 }
 
 .tip-section {

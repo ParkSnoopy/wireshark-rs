@@ -12,7 +12,8 @@ use leptos::prelude::*;
 use leptos::svg::Svg;
 use wasm_bindgen::JsCast;
 
-use crate::model::{Domains, Graph, Kind, Node, Rel, Scope, bytes};
+use crate::model::{Domains, Graph, Kind, Node, Ptrs, Rel, Scope, bytes, ptr_of};
+use crate::tip::{Card, Tip, facts};
 
 /// Build log entries rendered, newest first.
 const LOG_ROWS: usize = 300;
@@ -45,13 +46,16 @@ struct Body {
     y: f64,
     vx: f64,
     vy: f64,
-    /// Set by dragging: the layout leaves the body where the user put it.
+    /// Set by the Pin button: the layout leaves the body where it is.
     pinned: bool,
 }
 
 #[derive(Default)]
 struct Sim {
     bodies: Vec<Body>,
+    /// Body under the pointer during a drag: it follows the pointer, not the
+    /// layout, and moves freely again on release.
+    held: Option<usize>,
     alpha: f64,
     /// Alpha the layout moves toward: above zero while a node is dragged.
     target: f64,
@@ -122,6 +126,7 @@ impl Layout {
 fn step(s: &mut Sim, g: &Graph) -> bool {
     place_new(s, g);
     let a = s.alpha;
+    let held = s.held;
     let b = &mut s.bodies;
 
     // shortcut: all-pairs repulsion is O(n²); fine for a few hundred nodes.
@@ -168,8 +173,8 @@ fn step(s: &mut Sim, g: &Graph) -> bool {
             body.vy += (sy / count - body.y) * CLUSTER * a;
         }
     }
-    for body in b.iter_mut() {
-        if body.pinned {
+    for (i, body) in b.iter_mut().enumerate() {
+        if body.pinned || held == Some(i) {
             (body.vx, body.vy) = (0.0, 0.0);
             continue;
         }
@@ -250,6 +255,7 @@ pub fn GraphPage(
     active: Signal<bool>,
     /// Registration data of host names, for the recent-domain mark.
     domains: RwSignal<Domains>,
+    ptrs: RwSignal<Ptrs>,
 ) -> impl IntoView {
     let flagged = move |i: usize| {
         let name = graph.with(|g| g.nodes.get(i).and_then(|n| n.name.clone()));
@@ -269,6 +275,9 @@ pub fn GraphPage(
         k: 1.0,
     });
     let selected = RwSignal::new(None::<usize>);
+    // Node under the pointer and the pointer, for the hover card.
+    let hover = RwSignal::new(None::<usize>);
+    let cursor = RwSignal::new((0, 0));
     let grab = StoredValue::new(None::<Grab>);
     let svg = NodeRef::<Svg>::new();
     let centered = StoredValue::new(false);
@@ -371,6 +380,7 @@ pub fn GraphPage(
         if ev.button() != 0 {
             return;
         }
+        hover.set(None);
         let from = local(&ev);
         grab.set_value(Some(match node_at(&ev) {
             Some(i) => Grab::Node {
@@ -390,7 +400,14 @@ pub fn GraphPage(
         }
     };
     let on_move = move |ev: PointerEvent| {
-        let Some(g) = grab.get_value() else { return };
+        let Some(g) = grab.get_value() else {
+            let i = node_at(&ev);
+            if hover.get_untracked() != i {
+                hover.set(i);
+            }
+            cursor.set((ev.client_x(), ev.client_y()));
+            return;
+        };
         let p = local(&ev);
         let far = |from: (f64, f64)| (p.0 - from.0).hypot(p.1 - from.1) > DRAG_SLOP;
         grab.set_value(Some(match g {
@@ -411,13 +428,15 @@ pub fn GraphPage(
                     let c = camera.get_untracked();
                     sim.update_value(|s| {
                         if let Some(b) = s.bodies.get_mut(i) {
+                            // A pinned node stays pinned at its new place.
                             *b = Body {
                                 x: (p.0 - c.x) / c.k,
                                 y: (p.1 - c.y) / c.k,
-                                pinned: true,
+                                pinned: b.pinned,
                                 ..Body::default()
                             };
                         }
+                        s.held = Some(i);
                         s.target = 0.3;
                     });
                     layout.kick(0.3);
@@ -429,7 +448,12 @@ pub fn GraphPage(
     let on_up = move |_: PointerEvent| {
         let Some(g) = grab.get_value() else { return };
         grab.set_value(None);
-        sim.update_value(|s| s.target = 0.0);
+        sim.update_value(|s| {
+            s.target = 0.0;
+            s.held = None;
+        });
+        // Let the released node settle among its neighbors.
+        layout.kick(0.15);
         match g {
             // A click: inspect the node, or close the inspector when it is open on it.
             Grab::Node {
@@ -502,6 +526,7 @@ pub fn GraphPage(
                     on:pointermove=on_move
                     on:pointerup=on_up
                     on:pointercancel=on_up
+                    on:pointerleave=move |_| hover.set(None)
                     on:dblclick=move |ev| {
                         if let Some(i) = node_at(&ev) {
                             release(i);
@@ -611,14 +636,29 @@ pub fn GraphPage(
                     <span class="zoom-level">{move || format!("{:.0}%", camera.get().k * 100.0)}</span>
                 </div>
                 <p class="graph-hint">
-                    "Drag a node to pin it, double-click to release it. Drag the background to pan, scroll to zoom, click a node to inspect it."
+                    "Drag a node to move it. Click it to inspect it; Pin there keeps it in place, double-click releases it. Drag the background to pan, scroll to zoom."
                 </p>
             </div>
+            {move || {
+                let i = hover.get()?;
+                let (title, list, flag) = graph
+                    .with(|g| ptrs.with(|p| domains.with(|d| node_card(g, i, p, d))))?;
+                Some(view! {
+                    <Tip cursor>
+                        <h4>{title}</h4>
+                        {flag.map(|why| view! { <p class="tip-flag">{why}</p> })}
+                        {facts("tip-grid", list)}
+                        <p class="tip-hint">"Click to inspect"</p>
+                    </Tip>
+                })
+            }}
             <aside class="graph-side">
                 // The inspector comes first: it answers the click the user just made.
                 <Show when=move || selected.get().is_some()>
                     <Inspector
                         graph
+                        domains
+                        ptrs
                         selected
                         pinned=Signal::derive(move || selected.get().is_some_and(pinned))
                         on_select=Callback::new(select_and_center)
@@ -756,9 +796,66 @@ fn iface_text(local: bool, name: &str) -> String {
     }
 }
 
+/// Facts about node `i`, for the inspector and the hover card.
+fn node_facts(g: &Graph, i: usize, ptrs: &Ptrs, domains: &Domains) -> Vec<(&'static str, String)> {
+    let n = &g.nodes[i];
+    let mut list = vec![
+        (
+            "Class",
+            match n.kind {
+                Kind::Host => "Host".to_owned(),
+                Kind::Service { host } => format!("Service on {}", g.nodes[host].label),
+                Kind::Process { host } => format!("Process on {}", g.nodes[host].label),
+            },
+        ),
+        (
+            "Traffic",
+            format!("{} packets · {}", n.packets, bytes(n.bytes)),
+        ),
+    ];
+    if let Some(e) = g.log.iter().find(|e| e.node == i) {
+        list.push(("First seen", format!("{} s", e.time)));
+    }
+    if matches!(n.kind, Kind::Host) {
+        let block = n
+            .scope
+            .map_or("public".to_owned(), |s| format!("{} · {}", s.cidr, s.kind));
+        list.push(("Address", block));
+        if let Some(p) = ptr_of(ptrs, &n.label) {
+            list.push(("PTR", p.to_owned()));
+        }
+    }
+    if let Some(f) = &n.iface {
+        list.push(("Interface", iface_text(f.local, &f.name)));
+    }
+    if let Some(d) = n.name.as_ref().and_then(|name| domains.get(name)) {
+        list.push(("Domain", d.summary()));
+    }
+    list
+}
+
+/// Title, facts and recent-domain warning of the hover card for node `i`.
+fn node_card(g: &Graph, i: usize, ptrs: &Ptrs, domains: &Domains) -> Option<Card> {
+    let n = g.nodes.get(i)?;
+    let title = match &n.name {
+        Some(name) => format!("{name} ({})", n.label),
+        None => n.label.clone(),
+    };
+    let flag = n
+        .name
+        .as_ref()
+        .and_then(|name| Some(format!("⚠ {name} was {}", domains.get(name)?.flag()?)));
+    let mut list = node_facts(g, i, ptrs, domains);
+    let relations = g.edges.iter().filter(|e| e.from == i || e.to == i).count();
+    list.push(("Relations", relations.to_string()));
+    Some((title, list, flag))
+}
+
 #[component]
 fn Inspector(
     graph: RwSignal<Graph>,
+    domains: RwSignal<Domains>,
+    ptrs: RwSignal<Ptrs>,
     selected: RwSignal<Option<usize>>,
     pinned: Signal<bool>,
     on_select: Callback<usize>,
@@ -770,32 +867,13 @@ fn Inspector(
             .get()
             .and_then(|i| graph.with(|g| g.nodes.get(i).cloned()))
     };
-    let field = move |f: fn(&Graph, usize, &Node) -> Option<String>| {
-        move || {
-            let i = selected.get()?;
-            graph.with(|g| g.nodes.get(i).and_then(|n| f(g, i, n)))
-        }
+    let fact_list = move || {
+        let i = selected.get()?;
+        let list = graph.with(|g| {
+            ptrs.with(|p| domains.with(|d| (i < g.nodes.len()).then(|| node_facts(g, i, p, d))))
+        })?;
+        Some(facts("facts", list))
     };
-    let kind = field(|g, _, n| {
-        Some(match n.kind {
-            Kind::Host => "Host".to_owned(),
-            Kind::Service { host } => format!("Service on {}", g.nodes[host].label),
-            Kind::Process { host } => format!("Process on {}", g.nodes[host].label),
-        })
-    });
-    let traffic = field(|_, _, n| Some(format!("{} packets · {}", n.packets, bytes(n.bytes))));
-    let block = field(|_, _, n| match (n.kind, n.scope) {
-        (Kind::Host, Some(s)) => Some(format!("{} · {}", s.cidr, s.kind)),
-        (Kind::Host, None) => Some("public".to_owned()),
-        _ => None,
-    });
-    let iface = field(|_, _, n| n.iface.as_ref().map(|f| iface_text(f.local, &f.name)));
-    let first = field(|g, i, _| {
-        g.log
-            .iter()
-            .find(|e| e.node == i)
-            .map(|e| format!("{} s", e.time))
-    });
     let relations = move || {
         let Some(i) = selected.get() else {
             return Vec::new();
@@ -841,22 +919,7 @@ fn Inspector(
                     "Close"
                 </button>
             </div>
-            <dl class="facts">
-                <dt>"Class"</dt>
-                <dd>{kind}</dd>
-                <dt>"Traffic"</dt>
-                <dd>{traffic}</dd>
-                <dt>"First seen"</dt>
-                <dd>{first}</dd>
-                <Show when=move || block().is_some()>
-                    <dt>"Address"</dt>
-                    <dd>{block}</dd>
-                </Show>
-                <Show when=move || iface().is_some()>
-                    <dt>"Interface"</dt>
-                    <dd>{iface}</dd>
-                </Show>
-            </dl>
+            {fact_list}
             <p class="tip-title">"Relations"</p>
             <ul class="relations">
                 <For

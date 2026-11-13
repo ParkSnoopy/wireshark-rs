@@ -9,13 +9,11 @@ use leptos::html;
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
-use crate::model::{Col, Domains, IfRef, Row, Stack, TableView, bytes, duration, scope};
+use crate::model::{
+    Col, Domains, IfRef, Ptrs, Row, Stack, TableView, bytes, duration, ptr_of, scope,
+};
+use crate::tip::Tip;
 
-/// Width of `.tooltip-rich` in style.css.
-const CARD_WIDTH: i32 = 380;
-/// Distance from the arrow tip to the cursor, and from the arrow to the card edge.
-const CARD_GAP: i32 = 18;
-const ARROW_INSET: i32 = 22;
 /// Packets listed under "Recent in conversation".
 const RECENT: usize = 5;
 /// Rows rendered beyond each edge of the view.
@@ -49,6 +47,8 @@ pub fn PacketTable(
     sort: RwSignal<(Col, bool)>,
     /// Registration data of the host names seen, for the recent-domain flag.
     domains: RwSignal<Domains>,
+    /// Reverse DNS names, shown after addresses.
+    ptrs: RwSignal<Ptrs>,
 ) -> impl IntoView {
     let visible = Memo::new(move |_| view.with(|v| v.rows.clone()));
     let scroller = NodeRef::<html::Div>::new();
@@ -178,7 +178,8 @@ pub fn PacketTable(
                         {move || {
                             let stack = view.with(|v| v.stacks.get(&idx).copied());
                             let flag = domains.with(|d| rows.with(|r| r[idx].domain_flag(d)));
-                            rows.with(|r| packet_row(&r[idx], idx, stack, flag, selected))
+                            let names = ptrs.with(|p| rows.with(|r| ptr_names(p, &r[idx])));
+                            rows.with(|r| packet_row(&r[idx], idx, stack, flag, names, selected))
                         }}
                     </For>
                     <tr
@@ -201,7 +202,8 @@ pub fn PacketTable(
             rows.with(|rows| {
                 let current = rows.get(idx)?.clone();
                 let conversation: Vec<Row> = rows.iter().filter(|r| r.same_conversation(&current)).cloned().collect();
-                Some(view! { <HoverCard current conversation stack flag cursor /> })
+                let ptrs = ptrs.with(|p| ptr_names(p, &current));
+                Some(view! { <HoverCard current conversation stack flag ptrs cursor /> })
             })
         }}
     }
@@ -212,10 +214,10 @@ fn packet_row(
     idx: usize,
     stack: Option<Stack>,
     flag: Option<(String, String)>,
+    (src_ptr, dst_ptr): (Option<String>, Option<String>),
     selected: RwSignal<Option<usize>>,
 ) -> impl IntoView + use<> {
     let (src, dst) = r.labels();
-    let (src_title, dst_title) = (src.clone(), dst.clone());
     // A collapsed flow shows the size range of its packets.
     let len = match stack {
         Some(s) if s.min_len != s.max_len => format!("{}–{}", s.min_len, s.max_len),
@@ -230,12 +232,12 @@ fn packet_row(
             </td>
             <td>{r.time.clone()}</td>
             <td>
-                <span class="addr-label" title=src_title>{src}</span>
-                {addr_tag(&r.src, r.src_if.as_ref())}
+                <span class="addr-label">{src}</span>
+                {addr_tag(&r.src, r.src_if.as_ref(), src_ptr)}
             </td>
             <td>
-                <span class="addr-label" title=dst_title>{dst}</span>
-                {addr_tag(&r.dst, r.dst_if.as_ref())}
+                <span class="addr-label">{dst}</span>
+                {addr_tag(&r.dst, r.dst_if.as_ref(), dst_ptr)}
             </td>
             <td class="proto">
                 {r.protocol().to_owned()}
@@ -254,14 +256,26 @@ fn packet_row(
     }
 }
 
-/// Muted note after an address: its scope (`private`) and related interface.
-fn addr_tag(addr: &str, iface: Option<&IfRef>) -> Option<impl IntoView + use<>> {
-    let parts: Vec<&str> = scope(addr)
-        .map(|s| s.kind)
+/// Muted note after an address: its PTR name, scope (`private`) and
+/// related interface.
+fn addr_tag(
+    addr: &str,
+    iface: Option<&IfRef>,
+    ptr: Option<String>,
+) -> Option<impl IntoView + use<>> {
+    let parts: Vec<&str> = ptr
+        .as_deref()
         .into_iter()
+        .chain(scope(addr).map(|s| s.kind))
         .chain(iface.map(|i| i.name.as_str()))
         .collect();
     (!parts.is_empty()).then(|| view! { <span class="addr-tag">{parts.join(" · ")}</span> })
+}
+
+/// PTR names of a row's source and destination, when known.
+fn ptr_names(ptrs: &Ptrs, r: &Row) -> (Option<String>, Option<String>) {
+    let name = |a: &str| ptr_of(ptrs, a).map(str::to_owned);
+    (name(&r.src), name(&r.dst))
 }
 
 #[component]
@@ -309,34 +323,10 @@ fn HoverCard(
     conversation: Vec<Row>,
     stack: Option<Stack>,
     flag: Option<(String, String)>,
+    /// PTR names of the source and destination.
+    ptrs: (Option<String>, Option<String>),
     cursor: RwSignal<(i32, i32)>,
 ) -> impl IntoView {
-    // Below and right of the cursor; flips when that would leave the window.
-    let placement = move || {
-        let (x, y) = cursor.get();
-        let (width, height) = viewport();
-        let below = y < height / 2;
-        let start = x + CARD_WIDTH < width;
-        let left = if start {
-            x - ARROW_INSET
-        } else {
-            x + ARROW_INSET
-        };
-        let top = if below { y + CARD_GAP } else { y - CARD_GAP };
-        let shift = (
-            if start { "0" } else { "-100%" },
-            if below { "0" } else { "-100%" },
-        );
-        (
-            format!(
-                "left:{left}px;top:{top}px;transform:translate({},{})",
-                shift.0, shift.1
-            ),
-            if below { "bottom" } else { "top" },
-            if start { "start" } else { "end" },
-        )
-    };
-
     let (src, dst) = current.labels();
     let forward = conversation
         .iter()
@@ -348,7 +338,7 @@ fn HoverCard(
     let span = conversation.last().map_or(0.0, Row::secs) - t0;
     let recent: Vec<Row> = conversation.iter().rev().take(RECENT).cloned().collect();
     let chart = chart(&current, &conversation);
-    let end = |addr: &str, iface: &Option<IfRef>, process: &Option<String>| {
+    let end = |addr: &str, iface: &Option<IfRef>, process: &Option<String>, ptr: Option<String>| {
         let mut parts = Vec::new();
         if let Some(s) = scope(addr) {
             parts.push(format!("{} {}", s.kind, s.cidr));
@@ -363,21 +353,19 @@ fn HoverCard(
         if let Some(p) = process {
             parts.push(p.clone());
         }
-        if parts.is_empty() {
+        let text = if parts.is_empty() {
             "public".to_owned()
         } else {
             parts.join(" · ")
+        };
+        match ptr {
+            Some(p) => format!("PTR {p} · {text}"),
+            None => text,
         }
     };
 
     view! {
-        <div
-            class="tooltip tooltip-rich"
-            role="tooltip"
-            style=move || placement().0
-            data-side=move || placement().1
-            data-align=move || placement().2
-        >
+        <Tip cursor>
             <h4>{format!("{} {src} → {dst}", current.protocol().to_uppercase())}</h4>
             {flag.map(|(name, why)| view! {
                 <p class="tip-flag">{format!("⚠ {name} was {why}. Check that this traffic is expected.")}</p>
@@ -390,9 +378,9 @@ fn HoverCard(
                     <dd>{format!("{} packets, {}–{} bytes each, {} total", s.count, s.min_len, s.max_len, bytes(s.bytes))}</dd>
                 })}
                 <dt>"Source"</dt>
-                <dd>{end(&current.src, &current.src_if, &current.sproc)}</dd>
+                <dd>{end(&current.src, &current.src_if, &current.sproc, ptrs.0)}</dd>
                 <dt>"Destination"</dt>
-                <dd>{end(&current.dst, &current.dst_if, &current.dproc)}</dd>
+                <dd>{end(&current.dst, &current.dst_if, &current.dproc, ptrs.1)}</dd>
                 <dt>"Info"</dt>
                 <dd>{current.info.clone()}</dd>
             </dl>
@@ -424,7 +412,7 @@ fn HoverCard(
                         .collect_view()}
                 </ul>
             </div>
-        </div>
+        </Tip>
     }
 }
 
@@ -494,11 +482,4 @@ fn chart(current: &Row, conversation: &[Row]) -> impl IntoView + use<> {
             </text>
         </svg>
     }
-}
-
-fn viewport() -> (i32, i32) {
-    let w = window();
-    let size =
-        |v: Result<wasm_bindgen::JsValue, _>| v.ok().and_then(|v| v.as_f64()).unwrap_or(0.0) as i32;
-    (size(w.inner_width()), size(w.inner_height()))
 }

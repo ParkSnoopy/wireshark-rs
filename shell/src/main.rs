@@ -9,6 +9,7 @@ mod l7;
 mod names;
 mod owners;
 mod parse;
+mod ptr;
 mod rdap;
 
 use std::borrow::Cow;
@@ -30,6 +31,7 @@ use wry::{WebView, WebViewBuilder, WebViewBuilderExtUnix};
 use capture::Capture;
 use export::Recording;
 use names::Names;
+use ptr::{Ptr, PtrInfo};
 use rdap::{DomainInfo, Rdap};
 
 const ORIGIN: &str = "app://localhost/";
@@ -46,6 +48,8 @@ enum UserEvent {
     Socket(io::Result<OwnedFd>),
     /// Registration and transfer dates of a domain seen in traffic.
     Domain(DomainInfo),
+    /// Reverse DNS name of an address the UI asked about.
+    Ptr(PtrInfo),
     /// Outcome of a save, shown briefly in the UI.
     Notice(Notice),
 }
@@ -74,6 +78,7 @@ struct App {
     recording: Option<Arc<Recording>>,
     names: Names,
     rdap: Rdap,
+    ptr: Ptr,
     /// Open save dialog. GTK drops a native dialog that nothing holds.
     dialog: Option<gtk::FileChooserNative>,
     status: Status,
@@ -113,6 +118,11 @@ fn main() -> wry::Result<()> {
         // Fails only when the event loop is gone, i.e. during exit.
         Rdap::spawn(move |info| drop(proxy.send_event(UserEvent::Domain(info))))
     };
+    let ptr = {
+        let proxy = event_loop.create_proxy();
+        // Fails only when the event loop is gone, i.e. during exit.
+        Ptr::spawn(move |info| drop(proxy.send_event(UserEvent::Ptr(info))))
+    };
     let mut app = App {
         window,
         webview,
@@ -122,6 +132,7 @@ fn main() -> wry::Result<()> {
         recording: None,
         names: Names::default(),
         rdap,
+        ptr,
         dialog: None,
         status: Status {
             state: "pending",
@@ -134,6 +145,7 @@ fn main() -> wry::Result<()> {
             Event::NewEvents(StartCause::ResumeTimeReached { .. }) => app.drain(),
             Event::UserEvent(UserEvent::Ipc(msg)) => app.handle_ipc(&msg),
             Event::UserEvent(UserEvent::Domain(info)) => emit(&app.webview, "domain", &info),
+            Event::UserEvent(UserEvent::Ptr(info)) => emit(&app.webview, "ptr", &info),
             Event::UserEvent(UserEvent::Notice(n)) => {
                 app.dialog = None;
                 emit(&app.webview, "notice", &n);
@@ -167,12 +179,20 @@ fn main() -> wry::Result<()> {
 
 impl App {
     /// IPC messages from the UI: `hello`, `start <interface>`, `stop`,
-    /// `save-pcap`, or `save <file name>` with the file contents on the
-    /// following lines.
+    /// `save-pcap`, `save <file name>` with the file contents on the
+    /// following lines, or `ptr <address>...` for reverse DNS names.
     fn handle_ipc(&mut self, msg: &str) {
         if msg == "hello" {
             // The page may load after the authorization finished: resend the state.
             emit(&self.webview, "status", &self.status);
+            return;
+        }
+        if let Some(addrs) = msg.strip_prefix("ptr ") {
+            // Words that are not addresses are ignored.
+            addrs
+                .split_whitespace()
+                .filter_map(|a| a.parse().ok())
+                .for_each(|ip| self.ptr.check(ip));
             return;
         }
         if msg == "save-pcap" {

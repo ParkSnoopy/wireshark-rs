@@ -3,7 +3,7 @@
 //! `cargo test -p wireshark-ui`.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr};
 
 use serde::{Deserialize, Serialize};
@@ -72,6 +72,16 @@ impl DomainInfo {
             (Some(r), _) => Some(format!("registered {r} d ago")),
             (None, Some(t)) => Some(format!("transferred {t} d ago")),
             (None, None) => None,
+        }
+    }
+
+    /// Registrable domain and its registration date, like
+    /// `example.com · registered 1995-08-14`.
+    pub fn summary(&self) -> String {
+        match (&self.registered, &self.error) {
+            (Some(date), _) => format!("{} · registered {date}", self.site),
+            (None, Some(_)) => format!("{} · no registration data", self.site),
+            (None, None) => self.site.clone(),
         }
     }
 }
@@ -262,8 +272,102 @@ pub fn scope(addr: &str) -> Option<Scope> {
     }
 }
 
-/// Choices of the protocol filter. The first one matches everything.
-pub const PROTOCOLS: [&str; 6] = ["All protocols", "TCP", "UDP", "ICMP", "ARP", "Other"];
+/// Reverse DNS answers by address: `None` when the address has no PTR record.
+pub type Ptrs = HashMap<IpAddr, Option<String>>;
+
+/// PTR name of `addr`, when it was looked up and has one.
+pub fn ptr_of<'a>(ptrs: &'a Ptrs, addr: &str) -> Option<&'a str> {
+    ptrs.get(&addr.parse().ok()?)?.as_deref()
+}
+
+/// Address scopes the filter dialog offers; `public` is any other address.
+pub const SCOPES: [&str; 6] = [
+    "public",
+    "private",
+    "loopback",
+    "link-local",
+    "multicast",
+    "shared",
+];
+
+/// Filter dialog settings. An empty set or `None` places no limit.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Rules {
+    /// Protocols as the table shows them (`https`, `TCP`, `ARP`).
+    pub protocols: BTreeSet<String>,
+    /// Hide the chosen protocols instead of showing only them.
+    pub exclude: bool,
+    /// Either end is in one of these scopes.
+    pub scopes: BTreeSet<String>,
+    /// Port list like `443, 8000-8100`; either end's port must be in it.
+    pub ports: String,
+    pub min_len: Option<u32>,
+    pub max_len: Option<u32>,
+    /// Either end is on one of these interfaces.
+    pub ifaces: BTreeSet<String>,
+    /// Either end belongs to one of these processes.
+    pub processes: BTreeSet<String>,
+}
+
+impl Rules {
+    /// Number of settings that limit the table, for the button badge.
+    pub fn active(&self) -> usize {
+        [
+            !self.protocols.is_empty(),
+            !self.scopes.is_empty(),
+            !port_ranges(&self.ports).is_empty(),
+            self.min_len.is_some() || self.max_len.is_some(),
+            !self.ifaces.is_empty(),
+            !self.processes.is_empty(),
+        ]
+        .into_iter()
+        .filter(|&b| b)
+        .count()
+    }
+
+    fn matches(&self, r: &Row, ports: &[(u16, u16)]) -> bool {
+        let any = |set: &BTreeSet<String>, ends: [Option<&str>; 2]| {
+            set.is_empty() || ends.into_iter().flatten().any(|v| set.contains(v))
+        };
+        let proto = self.protocols.is_empty()
+            || (self.protocols.contains(r.protocol()) || self.protocols.contains(&r.proto))
+                != self.exclude;
+        let scope_of = |a: &str| scope(a).map_or("public", |s| s.kind);
+        let port_ok = ports.is_empty()
+            || [r.sport, r.dport]
+                .into_iter()
+                .flatten()
+                .any(|p| ports.iter().any(|&(lo, hi)| (lo..=hi).contains(&p)));
+        proto
+            && port_ok
+            && self.min_len.is_none_or(|m| r.len >= m)
+            && self.max_len.is_none_or(|m| r.len <= m)
+            && any(
+                &self.scopes,
+                [Some(scope_of(&r.src)), Some(scope_of(&r.dst))],
+            )
+            && any(
+                &self.ifaces,
+                [
+                    r.src_if.as_ref().map(|i| i.name.as_str()),
+                    r.dst_if.as_ref().map(|i| i.name.as_str()),
+                ],
+            )
+            && any(&self.processes, [r.sproc.as_deref(), r.dproc.as_deref()])
+    }
+}
+
+/// Parses `443, 8000-8100` into inclusive ranges; bad parts are skipped.
+pub fn port_ranges(text: &str) -> Vec<(u16, u16)> {
+    text.split([',', ' '])
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| match p.split_once('-') {
+            Some((a, b)) => Some((a.trim().parse().ok()?, b.trim().parse().ok()?)),
+            None => p.trim().parse().ok().map(|n| (n, n)),
+        })
+        .filter(|(a, b)| a <= b)
+        .collect()
+}
 
 /// An address block like `10.88.0.0/16`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -319,23 +423,25 @@ impl std::fmt::Display for Cidr {
 /// Table filter: every whitespace-separated term must occur in the row
 /// (number, endpoints, host names, protocols, info, process, interface or
 /// scope, case-insensitive). A term like `10.0.0.0/8` matches rows with an
-/// end in that block. The protocol must match the chosen `PROTOCOLS` entry.
+/// end in that block. The row must also pass the filter dialog's `Rules`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Filter {
     terms: Vec<String>,
     nets: Vec<Cidr>,
-    proto: String,
+    rules: Rules,
+    ports: Vec<(u16, u16)>,
 }
 
 impl Filter {
-    pub fn new(text: &str, proto: &str) -> Self {
+    pub fn new(text: &str, rules: &Rules) -> Self {
         let (nets, terms): (Vec<&str>, Vec<&str>) = text
             .split_whitespace()
             .partition(|t| Cidr::parse(t).is_some());
         Self {
             terms: terms.into_iter().map(str::to_lowercase).collect(),
             nets: nets.into_iter().filter_map(Cidr::parse).collect(),
-            proto: proto.to_owned(),
+            ports: port_ranges(&rules.ports),
+            rules: rules.clone(),
         }
     }
 
@@ -349,15 +455,8 @@ impl Filter {
         if !self.nets.iter().all(in_net) {
             return false;
         }
-        let proto_ok = match self.proto.as_str() {
-            "TCP" | "UDP" | "ARP" => r.proto == self.proto,
-            "ICMP" => r.proto.starts_with("ICMP"),
-            "Other" => {
-                !matches!(r.proto.as_str(), "TCP" | "UDP" | "ARP") && !r.proto.starts_with("ICMP")
-            }
-            _ => true,
-        };
-        proto_ok && self.terms.iter().all(|t| r.search.contains(t.as_str()))
+        self.rules.matches(r, &self.ports)
+            && self.terms.iter().all(|t| r.search.contains(t.as_str()))
     }
 }
 
@@ -888,13 +987,74 @@ mod tests {
         });
         let r = r.prepared();
         assert_eq!(r.endpoints().0, "[fe80::1]:53");
-        assert!(Filter::new("", "All protocols").matches(&r));
-        assert!(Filter::new("FE80 :5353", "UDP").matches(&r));
-        assert!(Filter::new("#7 firefox podman0 link-local private", "All protocols").matches(&r));
-        assert!(!Filter::new("fe80 tcp", "All protocols").matches(&r));
-        assert!(!Filter::new("", "TCP").matches(&r));
-        assert!(Filter::new("", "ICMP").matches(&row(1, "a", None, "b", None, "ICMPv6")));
-        assert!(Filter::new("", "Other").matches(&row(1, "a", None, "b", None, "IP proto 2")));
+        let any = Rules::default();
+        let only = |p: &str| Rules {
+            protocols: BTreeSet::from([p.to_owned()]),
+            ..Rules::default()
+        };
+        assert!(Filter::new("", &any).matches(&r));
+        assert!(Filter::new("FE80 :5353", &only("UDP")).matches(&r));
+        assert!(Filter::new("#7 firefox podman0 link-local private", &any).matches(&r));
+        assert!(!Filter::new("fe80 tcp", &any).matches(&r));
+        assert!(!Filter::new("", &only("TCP")).matches(&r));
+        let hide_udp = Rules {
+            exclude: true,
+            ..only("UDP")
+        };
+        assert!(!Filter::new("", &hide_udp).matches(&r));
+    }
+
+    #[test]
+    fn filter_dialog_rules() {
+        let mut r = row(1, "10.0.0.2", Some(51000), "8.8.8.8", Some(53), "UDP");
+        r.app = Some("dns".into());
+        r.len = 80;
+        r.sproc = Some("curl".into());
+        let r = r.prepared();
+        let pass = |rules: Rules| Filter::new("", &rules).matches(&r);
+        assert_eq!(
+            port_ranges("443, 8000-8100 x 9-1"),
+            [(443, 443), (8000, 8100)]
+        );
+        assert!(pass(Rules {
+            ports: "50-60".into(),
+            ..Rules::default()
+        }));
+        assert!(!pass(Rules {
+            ports: "443".into(),
+            ..Rules::default()
+        }));
+        // The application protocol or the transport.
+        assert!(pass(Rules {
+            protocols: BTreeSet::from(["dns".into()]),
+            ..Rules::default()
+        }));
+        assert!(pass(Rules {
+            scopes: BTreeSet::from(["public".into()]),
+            ..Rules::default()
+        }));
+        assert!(!pass(Rules {
+            scopes: BTreeSet::from(["loopback".into()]),
+            ..Rules::default()
+        }));
+        assert!(!pass(Rules {
+            min_len: Some(81),
+            ..Rules::default()
+        }));
+        assert!(pass(Rules {
+            processes: BTreeSet::from(["curl".into()]),
+            max_len: Some(80),
+            ..Rules::default()
+        }));
+        assert_eq!(
+            Rules {
+                ports: "nope".into(),
+                min_len: Some(1),
+                ..Rules::default()
+            }
+            .active(),
+            1
+        );
     }
 
     #[test]
@@ -916,9 +1076,10 @@ mod tests {
             Some(443),
             "TCP",
         );
-        assert!(Filter::new("10.88.0.0/16 :443", "TCP").matches(&r));
-        assert!(Filter::new("93.184.0.0/16", "All protocols").matches(&r));
-        assert!(!Filter::new("192.168.0.0/16", "All protocols").matches(&r));
+        let any = Rules::default();
+        assert!(Filter::new("10.88.0.0/16 :443", &any).matches(&r));
+        assert!(Filter::new("93.184.0.0/16", &any).matches(&r));
+        assert!(!Filter::new("192.168.0.0/16", &any).matches(&r));
     }
 
     #[test]
@@ -937,7 +1098,7 @@ mod tests {
         assert_eq!(r.labels().1, "example.com (93.184.216.34:443)");
         assert_eq!(r.labels().0, "10.0.0.2:51000");
         assert_eq!(r.protocol(), "https");
-        assert!(Filter::new("example https", "TCP").matches(&r));
+        assert!(Filter::new("example https", &Rules::default()).matches(&r));
 
         let mut domains = Domains::new();
         let info = |reg: i64, xfer: i64| DomainInfo {

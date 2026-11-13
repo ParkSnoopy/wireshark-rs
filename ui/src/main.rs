@@ -2,11 +2,13 @@
 //! `window.ipc.postMessage` (out) and `pkts` / `status` / `domain` /
 //! `notice` window events (in).
 
+mod filters;
 mod graph;
 mod model;
 mod networks;
 mod packets;
 mod select;
+mod tip;
 
 use leptos::ev::KeyboardEvent;
 use leptos::prelude::*;
@@ -14,9 +16,10 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use wasm_bindgen::prelude::*;
 
+use filters::FilterDialog;
 use graph::GraphPage;
 use model::{
-    Col, DomainInfo, Domains, Filter, Graph, Hosts, PROTOCOLS, Row, TableView, table_view,
+    Col, DomainInfo, Domains, Filter, Graph, Hosts, Ptrs, Row, Rules, TableView, table_view,
 };
 use networks::NetworksPage;
 use packets::PacketTable;
@@ -91,7 +94,11 @@ fn App() -> impl IntoView {
     let hosts = RwSignal::new(Hosts::default());
     // Domain data outlives a capture: it describes the domain, not the traffic.
     let domains = RwSignal::new(Domains::new());
-    let collapse = RwSignal::new(false);
+    // PTR names, and whether to look them up for every address seen.
+    let ptrs = RwSignal::new(Ptrs::new());
+    let ptr_on = RwSignal::new(false);
+    // On by default: under load, repeats of one flow fill the table.
+    let collapse = RwSignal::new(true);
     let recent_only = RwSignal::new(false);
     let notice = RwSignal::new(None::<Notice>);
     let status = RwSignal::new(Status {
@@ -100,7 +107,7 @@ fn App() -> impl IntoView {
     });
     let tab = RwSignal::new(Tab::Packets);
     let query = RwSignal::new(String::new());
-    let proto = RwSignal::new(PROTOCOLS[0].to_owned());
+    let rules = RwSignal::new(Rules::default());
     // Newest first: new packets enter at the top, the oldest end up at the bottom.
     let sort = RwSignal::new((Col::No, true));
 
@@ -108,7 +115,7 @@ fn App() -> impl IntoView {
         status.with(|s| matches!(s.state.as_str(), "pending" | "capturing"))
     });
     let seen = move || rows.with(|r| r.last().map_or(0, |r| r.no));
-    let filter = Memo::new(move |_| Filter::new(&query.get(), &proto.get()));
+    let filter = Memo::new(move |_| rules.with(|r| Filter::new(&query.get(), r)));
     let view = Memo::new(move |_| -> TableView {
         let f = filter.get();
         let recent = recent_only.get();
@@ -142,6 +149,40 @@ fn App() -> impl IntoView {
             domains.update(|m| {
                 m.insert(d.name.clone(), d);
             });
+        }
+    });
+    window_event_listener_untyped("ptr", move |ev| {
+        #[derive(Deserialize)]
+        struct Answer {
+            ip: String,
+            name: Option<String>,
+        }
+        if let Some(a) = detail::<Answer>(ev)
+            && let Ok(ip) = a.ip.parse()
+        {
+            ptrs.update(|p| {
+                p.insert(ip, a.name);
+            });
+        }
+    });
+    // While PTR lookup is on, ask the shell once for every new address.
+    let asked = StoredValue::new(std::collections::HashSet::new());
+    Effect::new(move |_| {
+        if !ptr_on.get() {
+            return;
+        }
+        let new: Vec<String> = hosts.with(|h| {
+            asked
+                .try_update_value(|a| {
+                    h.0.keys()
+                        .filter(|ip| a.insert(**ip))
+                        .map(ToString::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        if !new.is_empty() {
+            post_message(&format!("ptr {}", new.join(" ")));
         }
     });
     let notice_seq = StoredValue::new(0_u64);
@@ -258,6 +299,15 @@ fn App() -> impl IntoView {
                             }}
                         </button>
                     </Show>
+                    <button
+                        type="button"
+                        class="chip chip-filter ptr-toggle"
+                        aria-pressed=move || ptr_on.get().to_string()
+                        title="Look up the reverse DNS (PTR) name of every address seen, through the system resolver. The lookups show up in the capture as DNS traffic."
+                        on:click=move |_| ptr_on.update(|p| *p = !*p)
+                    >
+                        "PTR names"
+                    </button>
                     <span class="count">{seen} " packets"</span>
                 </div>
             </header>
@@ -296,12 +346,10 @@ fn App() -> impl IntoView {
                             prop:value=move || query.get()
                             on:input=move |ev| query.set(event_target_value(&ev))
                         />
-                        <Select
-                            id="proto"
-                            label="Protocol"
-                            hide_label=true
-                            options=Signal::stored(PROTOCOLS.map(str::to_owned).to_vec())
-                            value=proto
+                        <FilterDialog
+                            rules
+                            rows
+                            counts=Signal::derive(move || (view.with(|v| v.rows.len()), rows.with(Vec::len)))
                         />
                         <span class="filter-count">
                             {move || format!("{} of {}", view.with(|v| v.rows.len()), rows.with(Vec::len))}
@@ -316,7 +364,7 @@ fn App() -> impl IntoView {
                     aria-labelledby="tab-packets"
                     hidden=move || tab.get() != Tab::Packets
                 >
-                    <PacketTable rows view sort domains />
+                    <PacketTable rows view sort domains ptrs />
                 </div>
                 <div
                     role="tabpanel"
@@ -324,7 +372,7 @@ fn App() -> impl IntoView {
                     aria-labelledby="tab-graph"
                     hidden=move || tab.get() != Tab::Graph
                 >
-                    <GraphPage graph domains active=Signal::derive(move || tab.get() == Tab::Graph) />
+                    <GraphPage graph domains ptrs active=Signal::derive(move || tab.get() == Tab::Graph) />
                 </div>
                 <div
                     role="tabpanel"
@@ -335,6 +383,7 @@ fn App() -> impl IntoView {
                     <NetworksPage
                         hosts
                         domains
+                        ptrs
                         active=Signal::derive(move || tab.get() == Tab::Networks)
                         on_show=show_in_table
                     />
