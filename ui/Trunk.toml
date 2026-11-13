@@ -1,0 +1,3 @@
+# The shell embeds dist/ by fixed file names.
+[build]
+filehash = false
