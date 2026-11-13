@@ -29,7 +29,6 @@ fn main() {
         "src",
         "index.html",
         "style.css",
-        "app.js",
         "fonts",
         "Cargo.toml",
         "Trunk.toml",

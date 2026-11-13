@@ -1,12 +1,15 @@
-//! Data model without DOM access: packet rows, the table filter, and the
-//! capture graph. Host-testable with `cargo test -p wireshark-ui`.
+//! Data model without DOM access: packet rows, address scopes, the table
+//! filter and sort, and the capture graph. Host-testable with
+//! `cargo test -p wireshark-ui`.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr};
 
 use serde::Deserialize;
 
 /// One captured packet, as the shell sends it.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct Row {
     pub no: u64,
     pub time: String,
@@ -17,9 +20,51 @@ pub struct Row {
     pub info: String,
     pub sport: Option<u16>,
     pub dport: Option<u16>,
+    /// Interface that owns the address or whose network holds it.
+    #[serde(default)]
+    pub src_if: Option<IfRef>,
+    #[serde(default)]
+    pub dst_if: Option<IfRef>,
+    /// Process that owns the local socket of each end.
+    #[serde(default)]
+    pub sproc: Option<String>,
+    #[serde(default)]
+    pub dproc: Option<String>,
+    /// Lowercase text the filter searches. Filled by `Row::prepared`.
+    #[serde(skip)]
+    search: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct IfRef {
+    pub name: String,
+    /// True for an address of this host, false for one on the interface's network.
+    pub local: bool,
 }
 
 impl Row {
+    /// Fills the filter's search text once, so filtering a long capture
+    /// allocates nothing per row.
+    pub fn prepared(mut self) -> Self {
+        let (src, dst) = self.endpoints();
+        let names = [&self.sproc, &self.dproc].into_iter().flatten();
+        let ifaces = [&self.src_if, &self.dst_if]
+            .into_iter()
+            .flatten()
+            .map(|i| &i.name);
+        let scopes = [scope(&self.src), scope(&self.dst)]
+            .into_iter()
+            .flatten()
+            .map(|s| s.kind);
+        let mut text = format!("#{} {src} {dst} {} {}", self.no, self.proto, self.info);
+        for word in names.chain(ifaces).map(String::as_str).chain(scopes) {
+            text.push(' ');
+            text.push_str(word);
+        }
+        self.search = text.to_lowercase();
+        self
+    }
+
     /// Seconds since the first packet of the capture.
     pub fn secs(&self) -> f64 {
         self.time.parse().unwrap_or(0.0)
@@ -31,6 +76,15 @@ impl Row {
             endpoint(&self.src, self.sport),
             endpoint(&self.dst, self.dport),
         )
+    }
+
+    /// Owning processes: `a → b`, or the one that is known.
+    pub fn process(&self) -> String {
+        match (&self.sproc, &self.dproc) {
+            (Some(a), Some(b)) => format!("{a} → {b}"),
+            (Some(p), None) | (None, Some(p)) => p.clone(),
+            (None, None) => String::new(),
+        }
     }
 
     /// True when `other` is in the same conversation: same protocol and the
@@ -59,6 +113,15 @@ pub fn duration(secs: f64) -> String {
     }
 }
 
+/// Byte count with a binary unit.
+pub fn bytes(n: u64) -> String {
+    match n {
+        n if n < 1024 => format!("{n} B"),
+        n if n < 1024 * 1024 => format!("{:.1} KiB", n as f64 / 1024.0),
+        n => format!("{:.1} MiB", n as f64 / (1024.0 * 1024.0)),
+    }
+}
+
 fn endpoint(addr: &str, port: Option<u16>) -> String {
     match port {
         Some(p) if addr.contains(':') => format!("[{addr}]:{p}"),
@@ -67,12 +130,54 @@ fn endpoint(addr: &str, port: Option<u16>) -> String {
     }
 }
 
+/// A special-purpose address block that holds an address.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Scope {
+    pub cidr: &'static str,
+    /// `private`, `loopback`, `link-local`, `shared`, `multicast` or `broadcast`.
+    pub kind: &'static str,
+}
+
+/// IPv4 blocks of RFC 6890 that do not route on the public internet.
+const V4_SCOPES: [(u32, u32, &str, &str); 8] = [
+    (0x0a00_0000, 8, "10.0.0.0/8", "private"),
+    (0xac10_0000, 12, "172.16.0.0/12", "private"),
+    (0xc0a8_0000, 16, "192.168.0.0/16", "private"),
+    (0x6440_0000, 10, "100.64.0.0/10", "shared"),
+    (0x7f00_0000, 8, "127.0.0.0/8", "loopback"),
+    (0xa9fe_0000, 16, "169.254.0.0/16", "link-local"),
+    (0xe000_0000, 4, "224.0.0.0/4", "multicast"),
+    (0xffff_ffff, 32, "255.255.255.255/32", "broadcast"),
+];
+
+/// Scope of `addr`, or `None` for a public (global) address or a non-IP value.
+pub fn scope(addr: &str) -> Option<Scope> {
+    let v4 = |ip: Ipv4Addr| {
+        V4_SCOPES.iter().find_map(|&(net, prefix, cidr, kind)| {
+            let mask = u32::MAX << (32 - prefix);
+            (u32::from(ip) & mask == net).then_some(Scope { cidr, kind })
+        })
+    };
+    let scope = |cidr, kind| Some(Scope { cidr, kind });
+    match addr.parse::<IpAddr>().ok()? {
+        IpAddr::V4(ip) => v4(ip),
+        IpAddr::V6(ip) => match ip.segments()[0] {
+            _ if ip.is_loopback() => scope("::1/128", "loopback"),
+            _ if ip.to_ipv4_mapped().is_some() => ip.to_ipv4_mapped().and_then(v4),
+            s if s & 0xfe00 == 0xfc00 => scope("fc00::/7", "private"),
+            s if s & 0xffc0 == 0xfe80 => scope("fe80::/10", "link-local"),
+            s if s & 0xff00 == 0xff00 => scope("ff00::/8", "multicast"),
+            _ => None,
+        },
+    }
+}
+
 /// Choices of the protocol filter. The first one matches everything.
 pub const PROTOCOLS: [&str; 6] = ["All protocols", "TCP", "UDP", "ICMP", "ARP", "Other"];
 
 /// Table filter: every whitespace-separated term must occur in the row
-/// (number, endpoints, protocol or info, case-insensitive), and the protocol
-/// must match the chosen `PROTOCOLS` entry.
+/// (number, endpoints, protocol, info, process, interface or scope,
+/// case-insensitive), and the protocol must match the chosen `PROTOCOLS` entry.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Filter {
     terms: Vec<String>,
@@ -96,16 +201,40 @@ impl Filter {
             }
             _ => true,
         };
-        if !proto_ok {
-            return false;
-        }
-        if self.terms.is_empty() {
-            return true;
-        }
-        let (src, dst) = r.endpoints();
-        let text = format!("#{} {src} {dst} {} {}", r.no, r.proto, r.info).to_lowercase();
-        self.terms.iter().all(|t| text.contains(t.as_str()))
+        proto_ok && self.terms.iter().all(|t| r.search.contains(t.as_str()))
     }
+}
+
+/// Sortable table columns.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Col {
+    No,
+    Time,
+    Source,
+    Destination,
+    Protocol,
+    Length,
+    Process,
+    Info,
+}
+
+/// Compares two rows by `col` in ascending order.
+pub fn compare(a: &Row, b: &Row, col: Col) -> Ordering {
+    match col {
+        // Rows arrive in number and time order.
+        Col::No | Col::Time => a.no.cmp(&b.no),
+        Col::Source => addr_key(&a.src, a.sport).cmp(&addr_key(&b.src, b.sport)),
+        Col::Destination => addr_key(&a.dst, a.dport).cmp(&addr_key(&b.dst, b.dport)),
+        Col::Protocol => a.proto.cmp(&b.proto),
+        Col::Length => a.len.cmp(&b.len),
+        Col::Process => (&a.sproc, &a.dproc).cmp(&(&b.sproc, &b.dproc)),
+        Col::Info => a.info.cmp(&b.info),
+    }
+}
+
+/// Numeric order for IP addresses (10.0.0.9 before 10.0.0.10), text order otherwise.
+fn addr_key(addr: &str, port: Option<u16>) -> (Option<IpAddr>, &str, Option<u16>) {
+    (addr.parse().ok(), addr, port)
 }
 
 /// Class of a graph node.
@@ -115,17 +244,32 @@ pub enum Kind {
     Host,
     /// A protocol and port that the host at index `host` offers.
     Service { host: usize },
+    /// A local program (`firefox`) with sockets on the host at index `host`.
+    Process { host: usize },
 }
 
 /// Relation of a graph edge.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Rel {
-    /// Host → its service.
+    /// Host or process → the service it offers.
     Serves,
-    /// Client host → service.
+    /// Client host or process → service.
     Connects,
     /// Host → host, for traffic without ports (ICMP, ARP).
     Exchanges,
+    /// Process → the host it runs on.
+    RunsOn,
+}
+
+impl Rel {
+    pub fn name(self) -> &'static str {
+        match self {
+            Rel::Serves => "serves",
+            Rel::Connects => "connects to",
+            Rel::Exchanges => "exchanges",
+            Rel::RunsOn => "runs on",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -133,6 +277,11 @@ pub struct Node {
     pub label: String,
     pub kind: Kind,
     pub packets: u64,
+    pub bytes: u64,
+    /// Hosts only: the related interface, when the shell named one.
+    pub iface: Option<IfRef>,
+    /// Hosts only: the special-purpose block that holds the address.
+    pub scope: Option<Scope>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -142,6 +291,7 @@ pub struct Edge {
     pub rel: Rel,
     pub proto: String,
     pub packets: u64,
+    pub bytes: u64,
 }
 
 /// One step of the graph build: when a node or edge first appeared.
@@ -149,10 +299,12 @@ pub struct Edge {
 pub struct LogEntry {
     pub time: String,
     pub text: String,
+    /// Node the entry is about, for the inspector.
+    pub node: usize,
 }
 
-/// Capture graph: hosts, services and their relations, built packet by
-/// packet. It covers the whole capture, not only the rows the table keeps.
+/// Capture graph: hosts, services, processes and their relations, built
+/// packet by packet over the whole capture.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Graph {
     pub nodes: Vec<Node>,
@@ -167,21 +319,23 @@ impl Graph {
         if r.src.is_empty() || r.dst.is_empty() {
             return;
         }
-        let src = self.host(&r.time, &r.src);
-        let dst = self.host(&r.time, &r.dst);
+        let src = self.host(r, &r.src, &r.src_if);
+        let dst = self.host(r, &r.dst, &r.dst_if);
         if let (Some(sport), Some(dport)) = (r.sport, r.dport) {
             // shortcut: the lower port is taken as the service, so traffic between two
             // high ports may pick the wrong side; track SYN direction if that matters.
-            let (server, client, port) = if dport <= sport {
-                (dst, src, dport)
+            let (server, client, port, server_proc, client_proc) = if dport <= sport {
+                (dst, src, dport, &r.dproc, &r.sproc)
             } else {
-                (src, dst, sport)
+                (src, dst, sport, &r.sproc, &r.dproc)
             };
-            let svc = self.service(&r.time, server, &format!("{}/{port}", r.proto));
-            self.edge(&r.time, server, svc, Rel::Serves, &r.proto);
-            self.edge(&r.time, client, svc, Rel::Connects, &r.proto);
+            let svc = self.service(r, server, &format!("{}/{port}", r.proto));
+            let server = self.actor(r, server, server_proc);
+            let client = self.actor(r, client, client_proc);
+            self.edge(r, server, svc, Rel::Serves);
+            self.edge(r, client, svc, Rel::Connects);
         } else {
-            self.edge(&r.time, src, dst, Rel::Exchanges, &r.proto);
+            self.edge(r, src, dst, Rel::Exchanges);
         }
     }
 
@@ -189,52 +343,94 @@ impl Graph {
         self.edges.iter().filter(|e| e.rel == rel).count()
     }
 
+    pub fn count_kind(&self, f: fn(&Kind) -> bool) -> usize {
+        self.nodes.iter().filter(|n| f(&n.kind)).count()
+    }
+
     pub fn hosts(&self) -> usize {
-        self.nodes.iter().filter(|n| n.kind == Kind::Host).count()
+        self.count_kind(|k| *k == Kind::Host)
     }
 
-    fn host(&mut self, time: &str, addr: &str) -> usize {
-        let text = format!("New host {addr}");
-        self.node(time, format!("h {addr}"), addr, Kind::Host, text)
+    fn host(&mut self, r: &Row, addr: &str, iface: &Option<IfRef>) -> usize {
+        let i = self.node(r, format!("h {addr}"), addr, Kind::Host, || {
+            format!("New host {addr}")
+        });
+        let node = &mut self.nodes[i];
+        if node.iface.is_none() {
+            node.iface.clone_from(iface);
+        }
+        node.scope = scope(addr);
+        i
     }
 
-    fn service(&mut self, time: &str, host: usize, label: &str) -> usize {
-        let text = format!("New service {label} on {}", self.nodes[host].label);
+    fn service(&mut self, r: &Row, host: usize, label: &str) -> usize {
+        let on = self.nodes[host].label.clone();
         let key = format!("s {host} {label}");
-        self.node(time, key, label, Kind::Service { host }, text)
+        self.node(r, key, label, Kind::Service { host }, || {
+            format!("New service {label} on {on}")
+        })
     }
 
-    fn node(&mut self, time: &str, key: String, label: &str, kind: Kind, text: String) -> usize {
+    /// The process on `host` when the shell named one, else the host itself.
+    fn actor(&mut self, r: &Row, host: usize, process: &Option<String>) -> usize {
+        let Some(name) = process else { return host };
+        let on = self.nodes[host].label.clone();
+        let key = format!("p {host} {name}");
+        let p = self.node(r, key, name, Kind::Process { host }, || {
+            format!("New process {name} on {on}")
+        });
+        self.edge(r, p, host, Rel::RunsOn);
+        p
+    }
+
+    fn node(
+        &mut self,
+        r: &Row,
+        key: String,
+        label: &str,
+        kind: Kind,
+        text: impl FnOnce() -> String,
+    ) -> usize {
+        let len = u64::from(r.len);
         if let Some(&i) = self.nodes_by_key.get(&key) {
             self.nodes[i].packets += 1;
+            self.nodes[i].bytes += len;
             return i;
         }
+        let i = self.nodes.len();
         self.nodes.push(Node {
             label: label.to_owned(),
             kind,
             packets: 1,
+            bytes: len,
+            iface: None,
+            scope: None,
         });
-        self.log(time, text);
-        self.nodes_by_key.insert(key, self.nodes.len() - 1);
-        self.nodes.len() - 1
+        self.log(r, text(), i);
+        self.nodes_by_key.insert(key, i);
+        i
     }
 
-    fn edge(&mut self, time: &str, from: usize, to: usize, rel: Rel, proto: &str) {
+    fn edge(&mut self, r: &Row, from: usize, to: usize, rel: Rel) {
+        let len = u64::from(r.len);
+        let proto = if rel == Rel::RunsOn {
+            ""
+        } else {
+            r.proto.as_str()
+        };
         let key = (from, to, rel, proto.to_owned());
         if let Some(&i) = self.edges_by_key.get(&key) {
             self.edges[i].packets += 1;
+            self.edges[i].bytes += len;
             return;
         }
         let (a, b) = (&self.nodes[from].label, &self.nodes[to].label);
-        let text = match rel {
-            Rel::Serves => format!("{a} serves {b}"),
-            Rel::Connects => {
-                let Kind::Service { host } = self.nodes[to].kind else {
-                    unreachable!("connects always targets a service")
-                };
+        let text = match (rel, self.nodes[to].kind) {
+            (Rel::Connects, Kind::Service { host }) => {
                 format!("{a} connects to {b} on {}", self.nodes[host].label)
             }
-            Rel::Exchanges => format!("{a} exchanges {proto} with {b}"),
+            (Rel::Exchanges, _) => format!("{a} exchanges {proto} with {b}"),
+            _ => format!("{a} {} {b}", rel.name()),
         };
         self.edges.push(Edge {
             from,
@@ -242,15 +438,17 @@ impl Graph {
             rel,
             proto: proto.to_owned(),
             packets: 1,
+            bytes: len,
         });
-        self.log(time, text);
+        self.log(r, text, from);
         self.edges_by_key.insert(key, self.edges.len() - 1);
     }
 
-    fn log(&mut self, time: &str, text: String) {
+    fn log(&mut self, r: &Row, text: String, node: usize) {
         self.log.push(LogEntry {
-            time: time.to_owned(),
+            time: r.time.clone(),
             text,
+            node,
         });
     }
 }
@@ -277,7 +475,9 @@ mod tests {
             info: "hello".into(),
             sport,
             dport,
+            ..Row::default()
         }
+        .prepared()
     }
 
     #[test]
@@ -292,20 +492,47 @@ mod tests {
     }
 
     #[test]
-    fn duration_units() {
+    fn units() {
         assert_eq!(
             [duration(0.000166), duration(0.0425), duration(3.0)],
             ["166 µs", "42.5 ms", "3.00 s"]
         );
+        assert_eq!(
+            [bytes(512), bytes(1536), bytes(3 << 20)],
+            ["512 B", "1.5 KiB", "3.0 MiB"]
+        );
     }
 
     #[test]
-    fn filter_terms_and_protocol() {
-        let r = row(7, "fe80::1", Some(53), "10.0.0.2", Some(5353), "UDP");
+    fn scopes() {
+        let kind = |a: &str| scope(a).map(|s| (s.cidr, s.kind));
+        assert_eq!(kind("172.31.255.1"), Some(("172.16.0.0/12", "private")));
+        assert_eq!(kind("172.32.0.1"), None);
+        assert_eq!(kind("100.64.1.1"), Some(("100.64.0.0/10", "shared")));
+        assert_eq!(kind("8.8.8.8"), None);
+        assert_eq!(kind("fd12::1"), Some(("fc00::/7", "private")));
+        assert_eq!(kind("fe80::1"), Some(("fe80::/10", "link-local")));
+        assert_eq!(
+            kind("::ffff:192.168.1.2"),
+            Some(("192.168.0.0/16", "private"))
+        );
+        assert_eq!(kind("2001:db8::1"), None);
+        assert_eq!(kind(""), None);
+    }
+
+    #[test]
+    fn filter_terms_process_and_protocol() {
+        let mut r = row(7, "fe80::1", Some(53), "10.0.0.2", Some(5353), "UDP");
+        r.dproc = Some("firefox".into());
+        r.src_if = Some(IfRef {
+            name: "podman0".into(),
+            local: false,
+        });
+        let r = r.prepared();
         assert_eq!(r.endpoints().0, "[fe80::1]:53");
         assert!(Filter::new("", "All protocols").matches(&r));
         assert!(Filter::new("FE80 :5353", "UDP").matches(&r));
-        assert!(Filter::new("#7", "All protocols").matches(&r));
+        assert!(Filter::new("#7 firefox podman0 link-local private", "All protocols").matches(&r));
         assert!(!Filter::new("fe80 tcp", "All protocols").matches(&r));
         assert!(!Filter::new("", "TCP").matches(&r));
         assert!(Filter::new("", "ICMP").matches(&row(1, "a", None, "b", None, "ICMPv6")));
@@ -313,16 +540,19 @@ mod tests {
     }
 
     #[test]
-    fn graph_builds_services_and_logs_each_new_fact_once() {
+    fn sort_addresses_numerically() {
+        let a = row(1, "10.0.0.9", None, "x", None, "ICMP");
+        let b = row(2, "10.0.0.10", None, "x", None, "ICMP");
+        assert_eq!(compare(&a, &b, Col::Source), Ordering::Less);
+        assert_eq!(compare(&b, &a, Col::No), Ordering::Greater);
+    }
+
+    #[test]
+    fn graph_builds_services_processes_and_logs_each_fact_once() {
         let mut g = Graph::default();
-        g.add(&row(
-            1,
-            "10.0.0.1",
-            Some(51000),
-            "10.0.0.2",
-            Some(443),
-            "TCP",
-        ));
+        let mut out = row(1, "10.0.0.1", Some(51000), "10.0.0.2", Some(443), "TCP");
+        out.sproc = Some("firefox".into());
+        g.add(&out);
         g.add(&row(
             2,
             "10.0.0.2",
@@ -335,17 +565,16 @@ mod tests {
         g.add(&row(4, "", None, "", None, "0x88cc"));
 
         assert_eq!(g.hosts(), 2);
-        assert_eq!(g.nodes.len(), 3);
+        assert_eq!(g.nodes.len(), 4);
         assert_eq!(g.nodes[2].label, "TCP/443");
         assert_eq!(g.nodes[2].kind, Kind::Service { host: 1 });
-        assert_eq!(g.nodes[2].packets, 2);
+        assert_eq!((g.nodes[2].packets, g.nodes[2].bytes), (2, 120));
+        assert_eq!(g.nodes[3].kind, Kind::Process { host: 0 });
+        assert_eq!(g.nodes[0].scope.map(|s| s.kind), Some("private"));
         assert_eq!(
-            (
-                g.count(Rel::Serves),
-                g.count(Rel::Connects),
-                g.count(Rel::Exchanges)
-            ),
-            (1, 1, 1)
+            [Rel::Serves, Rel::Connects, Rel::Exchanges, Rel::RunsOn].map(|r| g.count(r)),
+            // The reply carries no process name, so the host connects as well.
+            [1, 2, 1, 1]
         );
         let log: Vec<&str> = g.log.iter().map(|e| e.text.as_str()).collect();
         assert_eq!(
@@ -354,7 +583,10 @@ mod tests {
                 "New host 10.0.0.1",
                 "New host 10.0.0.2",
                 "New service TCP/443 on 10.0.0.2",
+                "New process firefox on 10.0.0.1",
+                "firefox runs on 10.0.0.1",
                 "10.0.0.2 serves TCP/443",
+                "firefox connects to TCP/443 on 10.0.0.2",
                 "10.0.0.1 connects to TCP/443 on 10.0.0.2",
                 "10.0.0.1 exchanges ICMP with 10.0.0.2",
             ]

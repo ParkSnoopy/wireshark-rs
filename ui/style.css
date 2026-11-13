@@ -863,13 +863,13 @@ body {
 }
 
 .table-scroll::-webkit-scrollbar,
-.log::-webkit-scrollbar {
+.graph-side::-webkit-scrollbar {
     width: 10px;
     height: 10px;
 }
 
 .table-scroll::-webkit-scrollbar-thumb,
-.log::-webkit-scrollbar-thumb {
+.graph-side::-webkit-scrollbar-thumb {
     border: 2px solid var(--surface);
     border-radius: var(--radius-full);
     background: var(--secondary);
@@ -885,7 +885,7 @@ body {
     position: sticky;
     top: 0;
     z-index: 1;
-    padding: 12px 16px;
+    padding: 0;
     border-bottom: 1px solid var(--divider);
     background: var(--surface);
     color: var(--text-muted);
@@ -893,6 +893,44 @@ body {
     letter-spacing: 0.04em;
     text-align: left;
     text-transform: uppercase;
+}
+
+/* Header buttons sort by their column; a second click reverses the order. */
+.th-sort {
+    display: flex;
+    gap: var(--space-xs);
+    align-items: center;
+    width: 100%;
+    padding: 12px 16px;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    letter-spacing: inherit;
+    text-transform: inherit;
+    cursor: pointer;
+}
+
+.packets th.num .th-sort {
+    justify-content: flex-end;
+}
+
+.th-sort:hover {
+    color: var(--primary);
+}
+
+.th-sort:focus-visible {
+    outline: none;
+    box-shadow: inset var(--shadow-focus);
+}
+
+.packets th[aria-sort="ascending"],
+.packets th[aria-sort="descending"] {
+    color: var(--primary);
+}
+
+.sort-mark {
+    font-size: 9px;
 }
 
 /* Lists spec: 52px rows. Packet rows use 40px so more fit on screen. */
@@ -912,6 +950,24 @@ body {
 .packets .proto {
     color: var(--primary);
     font-weight: 500;
+}
+
+.packets .process {
+    color: var(--primary);
+}
+
+/* Scope and interface after an address: plain muted text, no chip. */
+.addr-tag {
+    margin-left: 6px;
+    color: var(--text-muted);
+    font: var(--type-small);
+}
+
+/* Stand-ins for the rows outside the view; their height is set inline. */
+.packets tr.spacer td {
+    height: auto;
+    padding: 0;
+    border: 0;
 }
 
 .packets tbody tr {
@@ -1040,13 +1096,57 @@ body {
 .graph-canvas {
     position: relative;
     min-height: 0;
-    padding: var(--space-md);
+    overflow: hidden;
+    background: var(--wash);
 }
 
-.graph-canvas svg {
+.graph-svg {
     display: block;
     width: 100%;
     height: 100%;
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+}
+
+.graph-svg:active {
+    cursor: grabbing;
+}
+
+.graph-svg:focus-visible {
+    outline: none;
+    box-shadow: inset var(--shadow-focus);
+}
+
+.graph-tools {
+    position: absolute;
+    top: var(--space-md);
+    right: var(--space-md);
+    display: flex;
+    gap: var(--space-xs);
+    align-items: center;
+}
+
+.graph-tools .btn {
+    min-width: 36px;
+}
+
+.zoom-level {
+    min-width: 48px;
+    color: var(--text-muted);
+    font: var(--type-mono);
+    font-size: 12px;
+    text-align: right;
+}
+
+.graph-hint {
+    position: absolute;
+    right: var(--space-md);
+    bottom: var(--space-sm);
+    left: var(--space-md);
+    color: var(--text-muted);
+    font: var(--type-small);
+    pointer-events: none;
 }
 
 .graph-empty {
@@ -1070,13 +1170,38 @@ body {
     stroke: var(--secondary);
 }
 
+.edge[data-rel="runs-on"] {
+    stroke: var(--secondary);
+    stroke-dasharray: 1 3;
+}
+
+/* Frame around hosts in one private, loopback or link-local block. */
+.hull rect {
+    fill: rgb(196 149 106 / 8%);
+    stroke: var(--secondary);
+    stroke-dasharray: 6 4;
+}
+
+.hull text {
+    fill: var(--primary);
+    font: 500 12px / 18px var(--font-mono);
+}
+
+.node {
+    cursor: pointer;
+}
+
 .node-host circle {
     fill: var(--primary);
 }
 
 .node-service rect {
-    fill: var(--wash);
+    fill: var(--surface);
     stroke: var(--secondary);
+}
+
+.node-process rect {
+    fill: var(--text);
 }
 
 .node-label {
@@ -1089,11 +1214,134 @@ body {
     fill: var(--primary);
 }
 
+.node-note {
+    fill: var(--text-muted);
+    font: var(--type-small);
+    font-size: 11px;
+}
+
+/* Inspected node: a solid dark ring. Pinned nodes: a dashed one. */
+.node.selected circle,
+.node.selected rect {
+    stroke: var(--text);
+    stroke-width: 3;
+}
+
+.node.pinned:not(.selected) circle,
+.node.pinned:not(.selected) rect {
+    stroke: var(--text);
+    stroke-dasharray: 2 2;
+    stroke-width: 1.5;
+}
+
+/* While a node is inspected, everything it does not touch fades. */
+.node.dim,
+.edge.dim {
+    opacity: 0.18;
+}
+
+/* Ontology, inspector and log scroll together: each can be taller than the panel. */
 .graph-side {
-    display: grid;
-    grid-template-rows: auto auto 1fr;
     min-height: 0;
+    overflow-y: auto;
     border-left: 1px solid var(--divider);
+}
+
+.inspector {
+    padding: var(--space-md);
+    border-bottom: 1px solid var(--divider);
+    background: var(--wash);
+}
+
+.inspector-head {
+    display: flex;
+    gap: var(--space-sm);
+    align-items: center;
+    justify-content: space-between;
+}
+
+.inspector-head h3 {
+    overflow: hidden;
+    font: 500 15px / 22px var(--font-mono);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.facts {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 2px var(--space-md);
+    margin: var(--space-sm) 0;
+    font: var(--type-small);
+}
+
+.facts dt {
+    color: var(--text-muted);
+}
+
+.facts dd {
+    margin: 0;
+    font-family: var(--font-mono);
+    word-break: break-all;
+}
+
+.inspector .tip-title {
+    color: var(--text-muted);
+    font: 600 12px / 18px var(--font-body);
+}
+
+.relations {
+    max-height: 160px;
+    margin: 0 0 var(--space-sm);
+    padding: 0;
+    overflow-y: auto;
+    list-style: none;
+    font: var(--type-small);
+}
+
+.relations li {
+    display: grid;
+    grid-template-columns: 96px 1fr auto;
+    gap: var(--space-sm);
+    align-items: baseline;
+}
+
+.relations .rel {
+    color: var(--text-muted);
+}
+
+.relations .num {
+    font-family: var(--font-mono);
+}
+
+/* Text-like button for links inside lists. */
+.link {
+    overflow: hidden;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--primary);
+    font: inherit;
+    font-family: var(--font-mono);
+    text-align: left;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.link:hover {
+    text-decoration: underline;
+}
+
+.link:focus-visible {
+    border-radius: var(--radius-sm);
+    outline: none;
+    box-shadow: var(--shadow-focus);
+}
+
+.inspector-actions {
+    display: flex;
+    gap: var(--space-sm);
 }
 
 .ontology {
@@ -1140,14 +1388,32 @@ body {
 }
 
 .log {
-    min-height: 0;
-    overflow-y: auto;
+    margin: 0;
 }
 
 .log .list-item {
     min-height: 40px;
-    padding: 8px 16px;
+    padding: 0;
     font: var(--type-small);
+}
+
+.log-entry {
+    display: flex;
+    gap: var(--space-md);
+    align-items: baseline;
+    width: 100%;
+    padding: 8px 16px;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.log-entry:focus-visible {
+    outline: none;
+    box-shadow: inset var(--shadow-focus);
 }
 
 .log time {
@@ -1162,7 +1428,7 @@ body {
         animation: pulse 1.6s ease-in-out infinite;
     }
 
-    .packets tbody tr,
+    /* Not on packet rows: the virtual table mounts rows while scrolling. */
     .log .list-item {
         animation: arrive 600ms ease-out;
     }

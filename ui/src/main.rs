@@ -13,14 +13,11 @@ use serde::de::DeserializeOwned;
 use wasm_bindgen::prelude::*;
 
 use graph::GraphPage;
-use model::{Filter, Graph, PROTOCOLS, Row};
-use packets::PacketTable;
+use model::{Col, Filter, Graph, PROTOCOLS, Row, compare};
+use packets::{PacketTable, newest_first};
 use select::Select;
 
-/// Rows kept in the table. The shell sends at most this many per batch.
-const MAX_ROWS: usize = 1000;
-
-/// `state` is `idle`, `pending`, `capturing`, `stopped` or `error`.
+/// `state` is `pending`, `idle`, `capturing`, `stopped` or `error`.
 /// style.css colors the status dot by it.
 #[derive(Clone, Deserialize)]
 struct Status {
@@ -64,27 +61,33 @@ fn App() -> impl IntoView {
     let rows = RwSignal::new(Vec::<Row>::new());
     let graph = RwSignal::new(Graph::default());
     let status = RwSignal::new(Status {
-        state: "idle".to_owned(),
-        text: "ready".to_owned(),
+        state: "pending".to_owned(),
+        text: "waiting for capture permission".to_owned(),
     });
     let tab = RwSignal::new(Tab::Packets);
     let query = RwSignal::new(String::new());
     let proto = RwSignal::new(PROTOCOLS[0].to_owned());
+    // Newest first: new packets enter at the top, the oldest end up at the bottom.
+    let sort = RwSignal::new((Col::No, true));
 
     let busy = Signal::derive(move || {
         status.with(|s| matches!(s.state.as_str(), "pending" | "capturing"))
     });
     let seen = move || rows.with(|r| r.last().map_or(0, |r| r.no));
     let filter = Memo::new(move |_| Filter::new(&query.get(), &proto.get()));
-    // Newest first: new packets enter at the top, the oldest leave at the bottom.
     let visible = Memo::new(move |_| {
         let f = filter.get();
+        let (col, desc) = sort.get();
         rows.with(|r| {
-            r.iter()
-                .rev()
-                .filter(|r| f.matches(r))
-                .cloned()
-                .collect::<Vec<_>>()
+            let mut v: Vec<usize> = (0..r.len()).filter(|&i| f.matches(&r[i])).collect();
+            // Rows arrive in number order, so that order needs no sort.
+            if !newest_first((col, true)) {
+                v.sort_by(|&a, &b| compare(&r[a], &r[b], col));
+            }
+            if desc {
+                v.reverse();
+            }
+            v
         })
     });
 
@@ -94,17 +97,15 @@ fn App() -> impl IntoView {
             return;
         };
         graph.update(|g| batch.iter().for_each(|r| g.add(r)));
-        rows.update(|r| {
-            r.extend(batch);
-            let extra = r.len().saturating_sub(MAX_ROWS);
-            r.drain(..extra);
-        });
+        rows.update(|r| r.extend(batch.into_iter().map(Row::prepared)));
     });
     window_event_listener_untyped("status", move |ev| {
         if let Some(s) = detail::<Status>(ev) {
             status.set(s);
         }
     });
+    // The shell may have finished the launch authorization before this page loaded.
+    post_message("hello");
 
     let start = move |_| {
         rows.set(Vec::new());
@@ -162,7 +163,7 @@ fn App() -> impl IntoView {
                         <input
                             class="input"
                             type="search"
-                            placeholder="Filter: address, port, protocol, info"
+                            placeholder="Filter: address, port, process, private"
                             aria-label="Filter packets"
                             prop:value=move || query.get()
                             on:input=move |ev| query.set(event_target_value(&ev))
@@ -187,11 +188,7 @@ fn App() -> impl IntoView {
                     aria-labelledby="tab-packets"
                     hidden=move || tab.get() != Tab::Packets
                 >
-                    <PacketTable
-                        visible
-                        all=rows
-                        capture_empty=Signal::derive(move || rows.with(Vec::is_empty))
-                    />
+                    <PacketTable rows visible sort />
                 </div>
                 <div
                     role="tabpanel"

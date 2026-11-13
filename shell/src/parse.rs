@@ -16,6 +16,23 @@ pub struct Row {
     /// TCP/UDP ports; `None` for other protocols. The UI groups conversations by them.
     pub sport: Option<u16>,
     pub dport: Option<u16>,
+    /// Interface that owns the address or whose network holds it. Set by `owners`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub src_if: Option<IfRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dst_if: Option<IfRef>,
+    /// Process that owns the local socket of each end. Set by `owners`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sproc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dproc: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct IfRef {
+    pub name: String,
+    /// True for an address of this host, false for one on the interface's network.
+    pub local: bool,
 }
 
 struct Summary {
@@ -48,6 +65,10 @@ pub fn row(no: u64, rel_us: u64, len: u32, ethertype: u16, data: &[u8]) -> Row {
         info: s.info,
         sport: s.ports.map(|p| p.0),
         dport: s.ports.map(|p| p.1),
+        src_if: None,
+        dst_if: None,
+        sproc: None,
+        dproc: None,
     }
 }
 
