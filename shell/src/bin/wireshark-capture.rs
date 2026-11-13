@@ -1,9 +1,11 @@
 //! Minimal privileged capture helper.
 //!
-//! The binary needs only the CAP_NET_RAW file capability. It opens one
-//! AF_PACKET socket bound to one interface, drops every capability, and then
-//! writes the first `SNAPLEN` bytes of each packet to stdout.
+//! The GUI starts it through pkexec, so it runs as root. It opens one
+//! AF_PACKET socket bound to one interface, switches to the user who ran
+//! pkexec, drops every capability, and then writes the first `SNAPLEN` bytes
+//! of each packet to stdout.
 //!
+//! Output: the 4-byte `READY` marker once privileges are gone, then records.
 //! Record format (16-byte header, then `cap_len` bytes):
 //! `ts_us: u64 LE | wire_len: u32 LE | ethertype: u16 BE | cap_len: u16 LE`
 //! The data starts at the network layer (SOCK_DGRAM strips the link header).
@@ -17,6 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Bytes kept per packet: enough for IPv6 + TCP with options. Payload is not kept.
 const SNAPLEN: usize = 128;
 const ETH_P_ALL: u16 = 0x0003;
+/// Written once after the privilege drop. The GUI reads it before any record.
+const READY: &[u8; 4] = b"WSRK";
 
 fn main() {
     if let Err(e) = run() {
@@ -31,9 +35,12 @@ fn run() -> io::Result<()> {
         return Err(io::Error::other("usage: wireshark-capture <interface>"));
     };
     let fd = open_socket(&iface)?;
+    switch_to_pkexec_user()?;
     drop_privileges()?;
 
     let mut out = BufWriter::new(io::stdout().lock());
+    out.write_all(READY)?;
+    out.flush()?;
     let mut buf = [0u8; SNAPLEN];
     loop {
         // SAFETY: sockaddr_ll is a plain C struct; all-zero is a valid value.
@@ -113,6 +120,40 @@ fn open_socket(iface: &str) -> io::Result<OwnedFd> {
         return Err(io::Error::last_os_error());
     }
     Ok(fd)
+}
+
+/// When running as root, switches uid, gid and groups to the user who ran
+/// pkexec. Leaving uid 0 also clears the capability sets.
+fn switch_to_pkexec_user() -> io::Result<()> {
+    // SAFETY: plain syscall without arguments.
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+    let uid: libc::uid_t = std::env::var("PKEXEC_UID")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| {
+            io::Error::other("running as root without PKEXEC_UID: start through pkexec")
+        })?;
+    // SAFETY: getpwuid returns NULL or a pointer to a static record. The process
+    // is single-threaded and reads the record before any other passwd call.
+    let pw = unsafe { libc::getpwuid(uid) };
+    if pw.is_null() {
+        return Err(io::Error::other(format!("no passwd entry for uid {uid}")));
+    }
+    // SAFETY: pw is non-null and points to a valid passwd record.
+    let gid = unsafe { (*pw).pw_gid };
+    // Groups and gid first: only root may change them.
+    // SAFETY: plain syscalls; a null list with length 0 clears the groups.
+    let ok = unsafe {
+        libc::setgroups(0, std::ptr::null()) == 0
+            && libc::setresgid(gid, gid, gid) == 0
+            && libc::setresuid(uid, uid, uid) == 0
+    };
+    if !ok {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Clears the effective, permitted and inheritable capability sets and

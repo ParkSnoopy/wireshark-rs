@@ -1,0 +1,426 @@
+/* CafeBlend design tokens (cafeblend-DESIGN.md). */
+
+@font-face {
+    font-family: "DM Serif Display";
+    font-weight: 400;
+    font-display: swap;
+    src: url("/fonts/dm-serif-display-400.woff2") format("woff2");
+}
+
+@font-face {
+    font-family: "Work Sans";
+    font-weight: 400;
+    font-display: swap;
+    src: url("/fonts/work-sans-400.woff2") format("woff2");
+}
+
+@font-face {
+    font-family: "Work Sans";
+    font-weight: 500;
+    font-display: swap;
+    src: url("/fonts/work-sans-500.woff2") format("woff2");
+}
+
+@font-face {
+    font-family: "Work Sans";
+    font-weight: 600;
+    font-display: swap;
+    src: url("/fonts/work-sans-600.woff2") format("woff2");
+}
+
+@font-face {
+    font-family: "IBM Plex Mono";
+    font-weight: 400;
+    font-display: swap;
+    src: url("/fonts/ibm-plex-mono-400.woff2") format("woff2");
+}
+
+@font-face {
+    font-family: "IBM Plex Mono";
+    font-weight: 500;
+    font-display: swap;
+    src: url("/fonts/ibm-plex-mono-500.woff2") format("woff2");
+}
+
+:root {
+    --primary: #8b5e3c;
+    --primary-hover: #6b4226;
+    --secondary: #c4956a;
+    --background: #fdf6ec;
+    --surface: #ffffff;
+    --surface-inset: #f0e6d6;
+    --surface-inset-hover: #ebe0d0;
+    --wash: #faf0e1;
+    --divider: #e8ddd0;
+    --text: #3e2723;
+    --text-muted: #6d4c41;
+
+    /* Status chips: background from the spec. Text is one step darker than
+       the spec so 12px text passes WCAG AA (4.5:1) on its background. */
+    --success-bg: #dcfce7;
+    --success-text: #047857;
+    --warning-bg: #fef3c7;
+    --warning-text: #b45309;
+    --error-bg: #fee2e2;
+    --error-text: #b91c1c;
+    --info-bg: #ede9fe;
+    --info-text: #4f46e5;
+
+    --font-headline: "DM Serif Display", Georgia, serif;
+    --font-body: "Work Sans", system-ui, sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+
+    --space-xs: 4px;
+    --space-sm: 8px;
+    --space-md: 16px;
+    --space-lg: 24px;
+
+    --radius-sm: 6px;
+    --radius-md: 12px;
+    --radius-full: 9999px;
+
+    --shadow-raised: 6px 6px 12px #d5c9b8, -6px -6px 12px #ffffff;
+    --shadow-raised-strong: 8px 8px 16px #d5c9b8, -8px -8px 16px #ffffff;
+    --shadow-inset: inset 4px 4px 8px #d5c9b8, inset -4px -4px 8px #ffffff;
+    --shadow-focus: 0 0 0 3px rgb(139 94 60 / 25%);
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    height: 100%;
+    margin: 0;
+}
+
+body {
+    background: var(--background);
+    color: var(--text);
+    font: 400 14px / 22px var(--font-body);
+}
+
+/* Layout: toolbar on the cream background, packet card below. */
+
+.app {
+    display: grid;
+    grid-template-rows: auto 1fr;
+    gap: var(--space-lg);
+    height: 100%;
+    padding: var(--space-lg);
+}
+
+.toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--space-lg);
+}
+
+.brand {
+    margin-right: auto;
+}
+
+.brand h1 {
+    margin: 0;
+    color: var(--primary);
+    font: 400 26px / 34px var(--font-headline);
+}
+
+.brand p {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 18px;
+}
+
+.controls {
+    display: flex;
+    align-items: flex-end;
+    gap: var(--space-md);
+}
+
+/* Inputs */
+
+.field {
+    display: flex;
+    flex-direction: column;
+}
+
+.field-label {
+    margin-bottom: 6px;
+    font-weight: 500;
+}
+
+.input {
+    appearance: none;
+    height: 42px;
+    min-width: 160px;
+    padding: 10px 40px 10px 14px;
+    border: none;
+    border-radius: var(--radius-md);
+    background-color: var(--surface-inset);
+    /* Chevron in --primary; the native GTK arrow ignores the theme. */
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%238b5e3c' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-position: right 16px center;
+    background-repeat: no-repeat;
+    box-shadow: var(--shadow-inset);
+    color: var(--text);
+    font: inherit;
+}
+
+.input:hover:not(:disabled) {
+    background-color: var(--surface-inset-hover);
+}
+
+.input:disabled {
+    background-color: #f5ede3;
+    box-shadow: none;
+    cursor: not-allowed;
+}
+
+.input:focus-visible {
+    outline: none;
+    box-shadow: var(--shadow-inset), var(--shadow-focus);
+}
+
+/* Buttons */
+
+.btn {
+    height: 42px;
+    padding: 8px 18px;
+    border: none;
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-raised);
+    font: 500 14px / 22px var(--font-body);
+    cursor: pointer;
+}
+
+.btn:focus-visible {
+    outline: none;
+    box-shadow: var(--shadow-raised), var(--shadow-focus);
+}
+
+.btn:active:not(:disabled) {
+    box-shadow: none;
+    transform: translateY(1px);
+}
+
+.btn:disabled {
+    box-shadow: none;
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.btn-primary {
+    background: var(--primary);
+    color: #ffffff;
+}
+
+.btn-primary:hover:not(:disabled) {
+    background: var(--primary-hover);
+}
+
+.btn-secondary {
+    background: var(--wash);
+    color: var(--primary);
+}
+
+.btn-secondary:hover:not(:disabled) {
+    box-shadow: var(--shadow-raised-strong);
+}
+
+/* Chips */
+
+.chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 10px;
+    border-radius: var(--radius-full);
+    background: var(--surface-inset);
+    color: var(--text-muted);
+    font: 500 12px / 18px var(--font-body);
+}
+
+.status-line {
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+    width: 100%;
+}
+
+.status {
+    padding: 4px 12px;
+}
+
+.status::before {
+    width: 8px;
+    height: 8px;
+    border-radius: var(--radius-full);
+    background: currentColor;
+    content: "";
+}
+
+.status[data-state="capturing"] {
+    background: var(--success-bg);
+    color: var(--success-text);
+}
+
+.status[data-state="pending"] {
+    background: var(--warning-bg);
+    color: var(--warning-text);
+}
+
+.status[data-state="error"] {
+    background: var(--error-bg);
+    color: var(--error-text);
+}
+
+.count {
+    color: var(--text-muted);
+    font: 400 13px / 20px var(--font-mono);
+}
+
+.proto[data-proto="TCP"] {
+    background: var(--wash);
+    color: var(--primary);
+}
+
+.proto[data-proto="UDP"] {
+    background: var(--info-bg);
+    color: var(--info-text);
+}
+
+.proto[data-proto^="ICMP"] {
+    background: var(--warning-bg);
+    color: var(--warning-text);
+}
+
+.proto[data-proto="ARP"] {
+    background: var(--success-bg);
+    color: var(--success-text);
+}
+
+/* Packet card */
+
+.packets {
+    min-height: 0;
+    overflow: hidden;
+    border-radius: var(--radius-md);
+    background: var(--surface);
+    box-shadow: var(--shadow-raised);
+}
+
+.table-scroll {
+    height: 100%;
+    overflow: auto;
+}
+
+.table-scroll:focus-visible {
+    outline: none;
+    box-shadow: inset var(--shadow-focus);
+}
+
+.table-scroll::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+.table-scroll::-webkit-scrollbar-thumb {
+    border: 2px solid var(--surface);
+    border-radius: var(--radius-full);
+    background: var(--secondary);
+}
+
+table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+}
+
+th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--divider);
+    background: var(--surface);
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    line-height: 18px;
+    text-align: left;
+    text-transform: uppercase;
+}
+
+td {
+    height: 40px;
+    padding: 0 16px;
+    border-bottom: 1px solid var(--divider);
+    font: 400 13px / 20px var(--font-mono);
+    white-space: nowrap;
+}
+
+.num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+tbody tr {
+    cursor: default;
+}
+
+tbody tr:hover {
+    background: var(--wash);
+}
+
+tbody tr.selected {
+    background: var(--surface-inset);
+}
+
+tbody tr.selected td:first-child {
+    box-shadow: inset 3px 0 0 var(--primary);
+}
+
+tr.empty td {
+    height: auto;
+    padding: 48px 16px;
+    color: var(--text-muted);
+    font-family: var(--font-body);
+    text-align: center;
+    white-space: normal;
+}
+
+/* Motion only when the user has not asked to reduce it. */
+
+@media (prefers-reduced-motion: no-preference) {
+    .btn {
+        transition:
+            background-color 150ms ease,
+            box-shadow 150ms ease,
+            transform 150ms ease;
+    }
+
+    .status[data-state="capturing"]::before {
+        animation: pulse 1.6s ease-in-out infinite;
+    }
+
+    tbody tr {
+        animation: arrive 600ms ease-out;
+    }
+}
+
+@keyframes arrive {
+    from {
+        background: var(--wash);
+    }
+}
+
+@keyframes pulse {
+    50% {
+        opacity: 0.3;
+    }
+}
