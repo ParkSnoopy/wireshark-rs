@@ -9,7 +9,7 @@ use leptos::html;
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
-use crate::model::{Col, IfRef, Row, bytes, duration, scope};
+use crate::model::{Col, Domains, IfRef, Row, Stack, TableView, bytes, duration, scope};
 
 /// Width of `.tooltip-rich` in style.css.
 const CARD_WIDTH: i32 = 380;
@@ -43,11 +43,14 @@ pub fn newest_first(sort: (Col, bool)) -> bool {
 pub fn PacketTable(
     /// Every row of the capture, in arrival order.
     rows: RwSignal<Vec<Row>>,
-    /// Indices into `rows` that pass the filter, in display order.
-    visible: Memo<Vec<usize>>,
+    /// Rows that pass the filter, in display order, with collapsed stacks.
+    view: Memo<TableView>,
     /// Sorted column and whether the order is descending.
     sort: RwSignal<(Col, bool)>,
+    /// Registration data of the host names seen, for the recent-domain flag.
+    domains: RwSignal<Domains>,
 ) -> impl IntoView {
+    let visible = Memo::new(move |_| view.with(|v| v.rows.clone()));
     let scroller = NodeRef::<html::Div>::new();
     let scroll_top = RwSignal::new(0.0);
     let view_height = RwSignal::new(1200.0);
@@ -84,8 +87,10 @@ pub fn PacketTable(
         if total <= old_total || el.scroll_top() <= 0 || !newest_first(sort.get_untracked()) {
             return;
         }
+        // Rows now above the old top row. A collapsed flow whose newest row
+        // was the top moves to a new index: then nothing is shifted.
         let added = old_top.map_or(0, |t| {
-            visible.with_untracked(|v| v.iter().take_while(|&&i| i != t).count())
+            visible.with_untracked(|v| v.iter().position(|&i| i == t).unwrap_or(0))
         });
         let shift = added as f64 * row_height.get_untracked();
         // After this update reaches the DOM, before the next paint.
@@ -170,7 +175,11 @@ pub fn PacketTable(
                         <td colspan="8"></td>
                     </tr>
                     <For each=window_rows key=|i| *i let:idx>
-                        {move || rows.with(|r| packet_row(&r[idx], idx, selected))}
+                        {move || {
+                            let stack = view.with(|v| v.stacks.get(&idx).copied());
+                            let flag = domains.with(|d| rows.with(|r| r[idx].domain_flag(d)));
+                            rows.with(|r| packet_row(&r[idx], idx, stack, flag, selected))
+                        }}
                     </For>
                     <tr
                         class="spacer"
@@ -187,27 +196,60 @@ pub fn PacketTable(
         </div>
         {move || {
             let idx = hover.get()?;
+            let stack = view.with(|v| v.stacks.get(&idx).copied());
+            let flag = domains.with(|d| rows.with(|r| r.get(idx)?.domain_flag(d)));
             rows.with(|rows| {
                 let current = rows.get(idx)?.clone();
                 let conversation: Vec<Row> = rows.iter().filter(|r| r.same_conversation(&current)).cloned().collect();
-                Some(view! { <HoverCard current conversation cursor /> })
+                Some(view! { <HoverCard current conversation stack flag cursor /> })
             })
         }}
     }
 }
 
-fn packet_row(r: &Row, idx: usize, selected: RwSignal<Option<usize>>) -> impl IntoView + use<> {
-    let (src, dst) = r.endpoints();
+fn packet_row(
+    r: &Row,
+    idx: usize,
+    stack: Option<Stack>,
+    flag: Option<(String, String)>,
+    selected: RwSignal<Option<usize>>,
+) -> impl IntoView + use<> {
+    let (src, dst) = r.labels();
+    let (src_title, dst_title) = (src.clone(), dst.clone());
+    // A collapsed flow shows the size range of its packets.
+    let len = match stack {
+        Some(s) if s.min_len != s.max_len => format!("{}–{}", s.min_len, s.max_len),
+        _ => r.len.to_string(),
+    };
+    let flagged = flag.is_some();
     view! {
-        <tr data-idx=idx class:selected=move || selected.get() == Some(idx)>
-            <td class="num">{r.no}</td>
+        <tr data-idx=idx class:selected=move || selected.get() == Some(idx) class:flagged=flagged>
+            <td class="num">
+                {stack.map(|s| view! { <span class="stack-count" title="Packets collapsed into this row">{format!("×{}", s.count)}</span> })}
+                {r.no}
+            </td>
             <td>{r.time.clone()}</td>
-            <td>{src} {addr_tag(&r.src, r.src_if.as_ref())}</td>
-            <td>{dst} {addr_tag(&r.dst, r.dst_if.as_ref())}</td>
-            <td class="proto">{r.proto.clone()}</td>
-            <td class="num">{r.len}</td>
+            <td>
+                <span class="addr-label" title=src_title>{src}</span>
+                {addr_tag(&r.src, r.src_if.as_ref())}
+            </td>
+            <td>
+                <span class="addr-label" title=dst_title>{dst}</span>
+                {addr_tag(&r.dst, r.dst_if.as_ref())}
+            </td>
+            <td class="proto">
+                {r.protocol().to_owned()}
+                {r.app.is_some().then(|| view! { <span class="addr-tag">{r.proto.clone()}</span> })}
+            </td>
+            <td class="num">{len}</td>
             <td class="process">{r.process()}</td>
-            <td>{r.info.clone()}</td>
+            <td>
+                {flag.map(|(name, why)| {
+                    let title = format!("{name} was {why}");
+                    view! { <span class="chip chip-warning domain-flag" title=title>"⚠ "{why}</span> }
+                })}
+                {r.info.clone()}
+            </td>
         </tr>
     }
 }
@@ -262,7 +304,13 @@ fn SortHeader(
 }
 
 #[component]
-fn HoverCard(current: Row, conversation: Vec<Row>, cursor: RwSignal<(i32, i32)>) -> impl IntoView {
+fn HoverCard(
+    current: Row,
+    conversation: Vec<Row>,
+    stack: Option<Stack>,
+    flag: Option<(String, String)>,
+    cursor: RwSignal<(i32, i32)>,
+) -> impl IntoView {
     // Below and right of the cursor; flips when that would leave the window.
     let placement = move || {
         let (x, y) = cursor.get();
@@ -289,7 +337,7 @@ fn HoverCard(current: Row, conversation: Vec<Row>, cursor: RwSignal<(i32, i32)>)
         )
     };
 
-    let (src, dst) = current.endpoints();
+    let (src, dst) = current.labels();
     let forward = conversation
         .iter()
         .filter(|r| r.same_direction(&current))
@@ -330,10 +378,17 @@ fn HoverCard(current: Row, conversation: Vec<Row>, cursor: RwSignal<(i32, i32)>)
             data-side=move || placement().1
             data-align=move || placement().2
         >
-            <h4>{format!("{} {src} → {dst}", current.proto)}</h4>
+            <h4>{format!("{} {src} → {dst}", current.protocol().to_uppercase())}</h4>
+            {flag.map(|(name, why)| view! {
+                <p class="tip-flag">{format!("⚠ {name} was {why}. Check that this traffic is expected.")}</p>
+            })}
             <dl class="tip-grid">
                 <dt>"Packet"</dt>
-                <dd>{format!("#{} at {} s, {} bytes", current.no, current.time, current.len)}</dd>
+                <dd>{format!("#{} at {} s, {} bytes, {}", current.no, current.time, current.len, current.proto)}</dd>
+                {stack.map(|s| view! {
+                    <dt>"Collapsed"</dt>
+                    <dd>{format!("{} packets, {}–{} bytes each, {} total", s.count, s.min_len, s.max_len, bytes(s.bytes))}</dd>
+                })}
                 <dt>"Source"</dt>
                 <dd>{end(&current.src, &current.src_if, &current.sproc)}</dd>
                 <dt>"Destination"</dt>

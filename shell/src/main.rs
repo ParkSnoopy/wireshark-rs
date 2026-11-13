@@ -4,25 +4,33 @@
 //! and Stop then only bind and unbind that socket: no prompt, no root.
 
 mod capture;
+mod export;
+mod l7;
+mod names;
 mod owners;
 mod parse;
+mod rdap;
 
 use std::borrow::Cow;
 use std::io;
 use std::os::fd::OwnedFd;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tao::dpi::LogicalSize;
 use tao::event::{Event, StartCause, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::platform::unix::WindowExtUnix;
 use tao::window::WindowBuilder;
 use wry::http::{Response, header::CONTENT_TYPE};
 use wry::{WebView, WebViewBuilder, WebViewBuilderExtUnix};
 
 use capture::Capture;
+use export::Recording;
+use names::Names;
+use rdap::{DomainInfo, Rdap};
 
 const ORIGIN: &str = "app://localhost/";
 /// How often captured rows are pushed to the UI.
@@ -36,6 +44,16 @@ enum UserEvent {
     Ipc(String),
     /// Result of the launch-time authorization.
     Socket(io::Result<OwnedFd>),
+    /// Registration and transfer dates of a domain seen in traffic.
+    Domain(DomainInfo),
+    /// Outcome of a save, shown briefly in the UI.
+    Notice(Notice),
+}
+
+#[derive(Serialize)]
+struct Notice {
+    ok: bool,
+    text: String,
 }
 
 /// Status shown in the UI. `state` is one of
@@ -47,9 +65,17 @@ struct Status {
 }
 
 struct App {
+    window: tao::window::Window,
     webview: WebView,
+    proxy: EventLoopProxy<UserEvent>,
     socket: Option<Arc<OwnedFd>>,
     capture: Option<Capture>,
+    /// Packets of the latest capture, kept after Stop for "Save pcap".
+    recording: Option<Arc<Recording>>,
+    names: Names,
+    rdap: Rdap,
+    /// Open save dialog. GTK drops a native dialog that nothing holds.
+    dialog: Option<gtk::FileChooserNative>,
     status: Status,
 }
 
@@ -82,21 +108,36 @@ fn main() -> wry::Result<()> {
         .with_url(ORIGIN)
         .build_gtk(window.default_vbox().expect("tao creates a default vbox"))?;
 
+    let rdap = {
+        let proxy = event_loop.create_proxy();
+        // Fails only when the event loop is gone, i.e. during exit.
+        Rdap::spawn(move |info| drop(proxy.send_event(UserEvent::Domain(info))))
+    };
     let mut app = App {
+        window,
         webview,
+        proxy: event_loop.create_proxy(),
         socket: None,
         capture: None,
+        recording: None,
+        names: Names::default(),
+        rdap,
+        dialog: None,
         status: Status {
             state: "pending",
             text: "waiting for capture permission".to_owned(),
         },
     };
     event_loop.run(move |event, _, control_flow| {
-        let _ = &window; // The window must live as long as the loop.
         match event {
             Event::NewEvents(StartCause::Init) => *control_flow = ControlFlow::Wait,
             Event::NewEvents(StartCause::ResumeTimeReached { .. }) => app.drain(),
             Event::UserEvent(UserEvent::Ipc(msg)) => app.handle_ipc(&msg),
+            Event::UserEvent(UserEvent::Domain(info)) => emit(&app.webview, "domain", &info),
+            Event::UserEvent(UserEvent::Notice(n)) => {
+                app.dialog = None;
+                emit(&app.webview, "notice", &n);
+            }
             Event::UserEvent(UserEvent::Socket(result)) => match result {
                 Ok(fd) => {
                     app.socket = Some(Arc::new(fd));
@@ -109,6 +150,8 @@ fn main() -> wry::Result<()> {
                 ..
             } => {
                 app.capture = None;
+                // tao may exit without dropping the app: delete the pcap file now.
+                app.recording = None;
                 *control_flow = ControlFlow::Exit;
                 return;
             }
@@ -123,12 +166,21 @@ fn main() -> wry::Result<()> {
 }
 
 impl App {
-    /// IPC messages from the UI: `hello`, `start <interface>` or `stop`.
+    /// IPC messages from the UI: `hello`, `start <interface>`, `stop`,
+    /// `save-pcap`, or `save <file name>` with the file contents on the
+    /// following lines.
     fn handle_ipc(&mut self, msg: &str) {
         if msg == "hello" {
             // The page may load after the authorization finished: resend the state.
             emit(&self.webview, "status", &self.status);
             return;
+        }
+        if msg == "save-pcap" {
+            return self.save_pcap();
+        }
+        if let Some(rest) = msg.strip_prefix("save ") {
+            let (name, body) = rest.split_once('\n').unwrap_or((rest, ""));
+            return self.save_text(name, body.to_owned());
         }
         // Dropping a capture stops it and unbinds the socket.
         self.capture = None;
@@ -144,6 +196,7 @@ impl App {
                 };
                 match Capture::start(Arc::clone(socket), iface) {
                     Ok(c) => {
+                        self.recording = Some(Arc::clone(&c.recording));
                         self.capture = Some(c);
                         self.set_status("capturing", format!("capturing on {iface}"));
                     }
@@ -161,7 +214,12 @@ impl App {
         let mut failed = None;
         for msg in c.rx.try_iter() {
             match msg {
-                Ok(row) => rows.push(row),
+                Ok(mut row) => {
+                    for name in self.names.annotate(&mut row) {
+                        self.rdap.check(name);
+                    }
+                    rows.push(row);
+                }
                 Err(text) => failed = Some(format!("capture on {} failed: {text}", c.iface)),
             }
         }
@@ -177,6 +235,52 @@ impl App {
     fn set_status(&mut self, state: &'static str, text: String) {
         self.status = Status { state, text };
         emit(&self.webview, "status", &self.status);
+    }
+
+    fn save_pcap(&mut self) {
+        let Some(rec) = self.recording.clone() else {
+            return self.notice(false, "nothing to save: start a capture first".to_owned());
+        };
+        self.ask_path("Save capture", "capture.pcap", move |path| {
+            rec.save_to(path)
+                .map(|n| format!("saved {n} bytes to {}", path.display()))
+        });
+    }
+
+    fn save_text(&mut self, name: &str, body: String) {
+        // The UI names the file; keep only a plain file name as the suggestion.
+        let name = Path::new(name)
+            .file_name()
+            .map_or("export.txt".into(), |n| n.to_string_lossy().into_owned());
+        self.ask_path("Export packets", &name, move |path| {
+            std::fs::write(path, &body).map(|()| format!("saved {}", path.display()))
+        });
+    }
+
+    /// Asks for a path, runs `save` with it and reports the outcome.
+    fn ask_path(
+        &mut self,
+        title: &str,
+        name: &str,
+        save: impl FnOnce(&Path) -> io::Result<String> + 'static,
+    ) {
+        let proxy = self.proxy.clone();
+        let dialog = export::ask_path(self.window.gtk_window(), title, name, move |path| {
+            let notice = match save(&path) {
+                Ok(text) => Notice { ok: true, text },
+                Err(e) => Notice {
+                    ok: false,
+                    text: format!("cannot save {}: {e}", path.display()),
+                },
+            };
+            // Fails only when the event loop is gone, i.e. during exit.
+            let _ = proxy.send_event(UserEvent::Notice(notice));
+        });
+        self.dialog = Some(dialog);
+    }
+
+    fn notice(&self, ok: bool, text: String) {
+        emit(&self.webview, "notice", &Notice { ok, text });
     }
 }
 

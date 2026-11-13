@@ -1,8 +1,10 @@
 //! Turns one captured record (network-layer bytes) into one table row.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::Serialize;
+
+use crate::l7::{self, L7};
 
 #[derive(Debug, Serialize)]
 pub struct Row {
@@ -26,6 +28,18 @@ pub struct Row {
     pub sproc: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dproc: Option<String>,
+    /// Application protocol, like `https` or `dns`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app: Option<&'static str>,
+    /// Host name each address was reached by. Set by `names`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub src_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dst_name: Option<String>,
+    /// Names this packet teaches: DNS answers, and the TLS SNI or HTTP
+    /// Host the client asked the destination for.
+    #[serde(skip)]
+    pub learned: Vec<(IpAddr, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -41,6 +55,16 @@ struct Summary {
     proto: String,
     info: String,
     ports: Option<(u16, u16)>,
+    app: Option<&'static str>,
+    learned: Vec<(IpAddr, String)>,
+}
+
+/// What the transport header and payload say.
+struct Transport {
+    proto: String,
+    info: String,
+    ports: Option<(u16, u16)>,
+    l7: L7,
 }
 
 /// `rel_us` is the time since the first packet of the capture.
@@ -69,6 +93,10 @@ pub fn row(no: u64, rel_us: u64, len: u32, ethertype: u16, data: &[u8]) -> Row {
         dst_if: None,
         sproc: None,
         dproc: None,
+        app: s.app,
+        src_name: None,
+        dst_name: None,
+        learned: s.learned,
     }
 }
 
@@ -80,6 +108,24 @@ impl Summary {
             proto,
             info: String::new(),
             ports: None,
+            app: None,
+            learned: Vec::new(),
+        }
+    }
+
+    fn ip(src: IpAddr, dst: IpAddr, t: Transport) -> Self {
+        let mut learned = t.l7.answers;
+        if let Some(name) = t.l7.server_name {
+            learned.push((dst, name));
+        }
+        Self {
+            src: src.to_string(),
+            dst: dst.to_string(),
+            proto: t.proto,
+            info: t.l7.info.unwrap_or(t.info),
+            ports: t.ports,
+            app: t.l7.app,
+            learned,
         }
     }
 }
@@ -98,28 +144,18 @@ fn ipv4(d: &[u8]) -> Option<Summary> {
     } else {
         &[]
     };
-    let (proto, info, ports) = transport(d[9], l4);
-    Some(Summary {
-        src: src.to_string(),
-        dst: dst.to_string(),
-        proto,
-        info,
-        ports,
-    })
+    Some(Summary::ip(src.into(), dst.into(), transport(d[9], l4)))
 }
 
 fn ipv6(d: &[u8]) -> Option<Summary> {
     let src = Ipv6Addr::from(<[u8; 16]>::try_from(d.get(8..24)?).ok()?);
     let dst = Ipv6Addr::from(<[u8; 16]>::try_from(d.get(24..40)?).ok()?);
     // shortcut: extension headers are not walked, so they show as "IP proto N"; walk them if that shows up often.
-    let (proto, info, ports) = transport(d[6], &d[40..]);
-    Some(Summary {
-        src: src.to_string(),
-        dst: dst.to_string(),
-        proto,
-        info,
-        ports,
-    })
+    Some(Summary::ip(
+        src.into(),
+        dst.into(),
+        transport(d[6], &d[40..]),
+    ))
 }
 
 fn arp(d: &[u8]) -> Option<Summary> {
@@ -143,27 +179,46 @@ fn arp(d: &[u8]) -> Option<Summary> {
         proto: "ARP".into(),
         info,
         ports: None,
+        app: None,
+        learned: Vec::new(),
     })
 }
 
-/// Returns the protocol name, the info text and the TCP/UDP ports.
-fn transport(proto: u8, d: &[u8]) -> (String, String, Option<(u16, u16)>) {
+/// Reads the transport header and, for TCP and UDP, the payload after it.
+fn transport(proto: u8, d: &[u8]) -> Transport {
     let (name, info) = match proto {
         1 => ("ICMP", icmp(d)),
         6 => ("TCP", tcp(d)),
         17 => ("UDP", ports(d)),
         58 => ("ICMPv6", icmp(d)),
-        p => return (format!("IP proto {p}"), String::new(), None),
+        p => {
+            return Transport {
+                proto: format!("IP proto {p}"),
+                info: String::new(),
+                ports: None,
+                l7: L7::default(),
+            };
+        }
     };
     let ports = match proto {
         6 | 17 => be16(d, 0).zip(be16(d, 2)),
         _ => None,
     };
-    (
-        name.into(),
-        info.unwrap_or_else(|| "truncated".into()),
+    let payload = match proto {
+        // TCP data offset: header length in 32-bit words.
+        6 => d.get(12).and_then(|o| d.get(usize::from(o >> 4) * 4..)),
+        _ => d.get(8..),
+    };
+    let l7 = match (ports, payload) {
+        (Some((sport, dport)), Some(p)) => l7::inspect(proto == 6, sport, dport, p),
+        _ => L7::default(),
+    };
+    Transport {
+        proto: name.into(),
+        info: info.unwrap_or_else(|| "truncated".into()),
         ports,
-    )
+        l7,
+    }
 }
 
 fn ports(d: &[u8]) -> Option<String> {

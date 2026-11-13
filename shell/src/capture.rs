@@ -4,6 +4,9 @@
 //! unbound AF_PACKET socket. A capture binds that socket to one interface
 //! and reads it on a thread; stopping binds it to protocol 0 again, which
 //! stops delivery. The shell never holds root or a capability.
+//!
+//! Whole packets are read: the parser looks into payloads for protocol
+//! names and host names, and the recording keeps them for export.
 
 use std::ffi::CString;
 use std::io::{self, Read};
@@ -16,20 +19,21 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::export::{Recording, SNAPLEN};
 use crate::owners::Owners;
 use crate::parse::{self, Row};
 
 const HELPER: &str = "wireshark-capture";
 /// Absolute path: never search PATH for the program that grants root.
 const PKEXEC: &str = "/usr/bin/pkexec";
-/// Bytes kept per packet: enough for IPv6 + TCP with options. Payload is not kept.
-const SNAPLEN: usize = 128;
 const ETH_P_ALL: u16 = 0x0003;
 
 pub struct Capture {
     pub iface: String,
     /// Captured rows, or the reason the capture failed.
     pub rx: Receiver<Result<Row, String>>,
+    /// Every packet of this capture, for "Save pcap". Outlives the capture.
+    pub recording: Arc<Recording>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     socket: Arc<OwnedFd>,
@@ -116,13 +120,18 @@ impl Capture {
             return Err(io::Error::last_os_error());
         }
 
+        let recording = Arc::new(Recording::create()?);
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let thread = {
-            let (socket, stop) = (Arc::clone(&socket), Arc::clone(&stop));
+            let (socket, stop, rec) = (
+                Arc::clone(&socket),
+                Arc::clone(&stop),
+                Arc::clone(&recording),
+            );
             std::thread::spawn(move || {
                 let mut owners = Owners::default();
-                let result = read_loop(&socket, &stop, |mut row| {
+                let result = read_loop(&socket, &stop, &rec, |mut row| {
                     owners.annotate(&mut row);
                     tx.send(Ok(row)).is_ok()
                 });
@@ -135,6 +144,7 @@ impl Capture {
         Ok(Self {
             iface: iface.to_owned(),
             rx,
+            recording,
             stop,
             thread: Some(thread),
             socket,
@@ -155,13 +165,15 @@ impl Drop for Capture {
     }
 }
 
-/// Reads packets until `stop` is set or `emit` returns false.
+/// Reads packets until `stop` is set or `emit` returns false, and records
+/// each one.
 fn read_loop(
     socket: &OwnedFd,
     stop: &AtomicBool,
+    recording: &Recording,
     mut emit: impl FnMut(Row) -> bool,
 ) -> io::Result<()> {
-    let mut buf = [0u8; SNAPLEN];
+    let mut buf = vec![0u8; SNAPLEN];
     let mut first_us = None;
     let mut no = 0;
     while !stop.load(Ordering::Relaxed) {
@@ -201,13 +213,9 @@ fn read_loop(
         // sll_protocol is in network byte order.
         let ethertype = u16::from_be(addr.sll_protocol);
         let len = u32::try_from(wire_len).unwrap_or(u32::MAX);
-        if !emit(parse::row(
-            no,
-            rel_us,
-            len,
-            ethertype,
-            &buf[..wire_len.min(SNAPLEN)],
-        )) {
+        let data = &buf[..wire_len.min(SNAPLEN)];
+        recording.write(now_us, &addr, data, wire_len)?;
+        if !emit(parse::row(no, rel_us, len, ethertype, data)) {
             break;
         }
     }

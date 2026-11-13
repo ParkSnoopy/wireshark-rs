@@ -474,6 +474,7 @@ kbd {
     background: var(--surface-inset);
     color: var(--text-muted);
     font: 500 12px / 18px var(--font-body);
+    white-space: nowrap;
 }
 
 .chip-filter {
@@ -664,6 +665,7 @@ kbd {
     background: var(--surface-inset);
     color: var(--text-muted);
     font: 500 14px / 22px var(--font-body);
+    white-space: nowrap;
     cursor: pointer;
 }
 
@@ -806,11 +808,52 @@ body {
     font: var(--type-mono);
 }
 
-/* Tabs on the left, filter on the right, both on the cream background. */
+/* Outcome of an export, shown for a few seconds. */
+.notice {
+    color: var(--success-text);
+}
+
+.notice.is-error {
+    color: var(--error-text);
+}
+
+.recent-alert {
+    border: 0;
+    cursor: pointer;
+}
+
+.recent-alert:focus-visible {
+    outline: none;
+    box-shadow: var(--shadow-focus);
+}
+
+/* The export menu opens under its button, aligned to the right edge. */
+.export .menu {
+    right: 0;
+    left: auto;
+}
+
+.menu .menu-item {
+    width: 100%;
+    border: 0;
+    background: none;
+    font: var(--type-body);
+    text-align: left;
+}
+
+.menu .menu-item:focus-visible {
+    outline: none;
+    background: var(--wash);
+}
+
+/* Tabs on the left, filter on the right, both on the cream background.
+   When both do not fit, the filter moves to a line above the tabs, so the
+   tabs stay on the card. */
 .sheet-bar {
     display: flex;
+    flex-wrap: wrap-reverse;
     align-items: flex-end;
-    gap: var(--space-md);
+    gap: 0 var(--space-md);
     /* Filter height plus its margin: the card stays put when the filter hides. */
     min-height: 58px;
 }
@@ -823,7 +866,7 @@ body {
 }
 
 .filter > .input {
-    width: 260px;
+    width: 240px;
 }
 
 .filter .select {
@@ -849,6 +892,130 @@ body {
 
 .sheet > [role="tabpanel"] {
     height: 100%;
+}
+
+/* ---------- Networks page ---------- */
+/* Before the packet table: its rules are more specific and must come later. */
+
+.networks {
+    height: 100%;
+    overflow-y: auto;
+    padding: var(--space-lg);
+}
+
+.net-section + .net-section {
+    margin-top: var(--space-xl);
+}
+
+.net-head {
+    display: flex;
+    align-items: flex-end;
+    gap: var(--space-md);
+    margin-bottom: var(--space-md);
+}
+
+.net-head h3 {
+    margin-right: auto;
+    font: var(--type-h3);
+}
+
+.net-head .select {
+    width: 160px;
+}
+
+.net-note {
+    color: var(--text-muted);
+    font: var(--type-small);
+}
+
+.data-table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+}
+
+.data-table th {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--divider);
+    color: var(--text-muted);
+    font: 600 12px / 18px var(--font-body);
+    letter-spacing: 0.04em;
+    text-align: left;
+    text-transform: uppercase;
+}
+
+.host-row td {
+    background: var(--surface-inset);
+}
+
+.data-table td {
+    height: 40px;
+    padding: 0 16px;
+    border-bottom: 1px solid var(--divider);
+    font: var(--type-mono);
+    white-space: nowrap;
+}
+
+.host-row td:first-child {
+    padding-left: 44px;
+}
+
+.data-table tr.flagged td:first-child {
+    box-shadow: inset 3px 0 0 var(--warning);
+}
+
+.data-table .num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+/* Table cells grow with their content: the span keeps long name lists short. */
+.data-table .names span {
+    display: inline-block;
+    max-width: 240px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    vertical-align: bottom;
+}
+
+.data-table .actions {
+    width: 1%;
+    text-align: right;
+}
+
+.data-table .muted {
+    color: var(--text-muted);
+}
+
+.data-table tbody tr:hover {
+    background: var(--wash);
+}
+
+/* Block address that opens its list of addresses. */
+.disclosure {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-sm);
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--primary);
+    font: 500 13px / 20px var(--font-mono);
+    cursor: pointer;
+}
+
+.disclosure::before {
+    width: 12px;
+    content: "▸";
+}
+
+.disclosure[aria-expanded="true"]::before {
+    content: "▾";
+}
+
+.disclosure:focus-visible {
+    outline: none;
+    box-shadow: var(--shadow-focus);
 }
 
 /* ---------- Packet table ---------- */
@@ -963,6 +1130,34 @@ body {
     font: var(--type-small);
 }
 
+/* Long host names end in an ellipsis; the title holds the full label. */
+.addr-label {
+    display: inline-block;
+    max-width: 300px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    vertical-align: bottom;
+}
+
+/* Count of packets folded into a collapsed row, before its number. */
+.stack-count {
+    margin-right: var(--space-sm);
+    padding: 0 6px;
+    border-radius: var(--radius-full);
+    background: var(--surface-inset);
+    color: var(--primary);
+    font: 500 11px / 18px var(--font-mono);
+}
+
+/* Traffic with a recently registered or transferred domain. */
+.packets tbody tr.flagged td:first-child {
+    box-shadow: inset 3px 0 0 var(--warning);
+}
+
+.domain-flag {
+    margin-right: var(--space-sm);
+}
+
 /* Stand-ins for the rows outside the view; their height is set inline. */
 .packets tr.spacer td {
     height: auto;
@@ -986,7 +1181,8 @@ body {
     box-shadow: inset 3px 0 0 var(--primary);
 }
 
-.packets tr.empty td {
+.packets tr.empty td,
+.data-table tr.empty td {
     height: auto;
     padding: var(--space-2xl) var(--space-md);
     color: var(--text-muted);
@@ -1026,6 +1222,15 @@ body {
     margin: 0;
     font-family: var(--font-mono);
     word-break: break-all;
+}
+
+.tip-flag {
+    margin: var(--space-xs) 0;
+    padding: 4px 8px;
+    border-radius: var(--radius-sm);
+    background: var(--warning-bg);
+    color: var(--warning-text);
+    font-weight: 500;
 }
 
 .tip-section {
@@ -1218,6 +1423,19 @@ body {
     fill: var(--text-muted);
     font: var(--type-small);
     font-size: 11px;
+}
+
+/* A host whose domain was registered or transferred recently. Before the
+   selected and pinned rings, which override its stroke. */
+.node.flagged circle {
+    fill: var(--warning);
+    stroke: var(--warning-bg);
+    stroke-width: 4;
+}
+
+.node.flagged .node-label {
+    fill: var(--warning-text);
+    font-weight: 600;
 }
 
 /* Inspected node: a solid dark ring. Pinned nodes: a dashed one. */

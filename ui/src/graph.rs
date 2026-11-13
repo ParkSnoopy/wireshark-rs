@@ -12,7 +12,7 @@ use leptos::prelude::*;
 use leptos::svg::Svg;
 use wasm_bindgen::JsCast;
 
-use crate::model::{Graph, Kind, Node, Rel, Scope, bytes};
+use crate::model::{Domains, Graph, Kind, Node, Rel, Scope, bytes};
 
 /// Build log entries rendered, newest first.
 const LOG_ROWS: usize = 300;
@@ -245,7 +245,16 @@ fn hulls(g: &Graph, bodies: &[Body]) -> Vec<(String, f64, f64, f64, f64)> {
 }
 
 #[component]
-pub fn GraphPage(graph: RwSignal<Graph>, active: Signal<bool>) -> impl IntoView {
+pub fn GraphPage(
+    graph: RwSignal<Graph>,
+    active: Signal<bool>,
+    /// Registration data of host names, for the recent-domain mark.
+    domains: RwSignal<Domains>,
+) -> impl IntoView {
+    let flagged = move |i: usize| {
+        let name = graph.with(|g| g.nodes.get(i).and_then(|n| n.name.clone()));
+        name.is_some_and(|n| domains.with(|d| d.get(&n).and_then(|d| d.flag()).is_some()))
+    };
     let sim = StoredValue::new(Sim::default());
     let frame = RwSignal::new(0_u64);
     let layout = Layout {
@@ -576,6 +585,7 @@ pub fn GraphPage(graph: RwSignal<Graph>, active: Signal<bool>) -> impl IntoView 
                                             class:dim=move || dim(i)
                                             class:selected=move || selected.get() == Some(i)
                                             class:pinned=move || pinned(i)
+                                            class:flagged=move || flagged(i)
                                         >
                                             {node_shape(graph, i)}
                                         </g>
@@ -692,18 +702,25 @@ fn node_shape(graph: RwSignal<Graph>, i: usize) -> AnyView {
         Kind::Host => {
             let r =
                 move || graph.with(|g| 7.0 + (g.nodes[i].packets as f64).log2().clamp(0.0, 10.0));
+            // A host reached by name shows the name, and the address in the note.
+            let name = move || graph.with(|g| g.nodes[i].name.clone());
             let note = move || {
                 graph.with(|g| {
-                    g.nodes[i]
-                        .iface
+                    let n = &g.nodes[i];
+                    let parts: Vec<String> = n
+                        .name
                         .as_ref()
-                        .map(|f| iface_text(f.local, &f.name))
+                        .map(|_| n.label.clone())
+                        .into_iter()
+                        .chain(n.iface.as_ref().map(|f| iface_text(f.local, &f.name)))
+                        .collect();
+                    parts.join(" · ")
                 })
             };
             view! {
                 <circle r=r />
                 <text class="node-label" y=move || r() + 14.0 text-anchor="middle">
-                    {label}
+                    {move || name().unwrap_or_else(|| label.clone())}
                 </text>
                 <text class="node-note" y=move || r() + 27.0 text-anchor="middle">
                     {note}
@@ -812,7 +829,14 @@ fn Inspector(
     view! {
         <section class="inspector" aria-label="Selected node" aria-live="polite">
             <div class="inspector-head">
-                <h3>{move || node().map(|n| n.label)}</h3>
+                <h3>
+                    {move || {
+                        node().map(|n| match n.name {
+                            Some(name) => format!("{name} ({})", n.label),
+                            None => n.label,
+                        })
+                    }}
+                </h3>
                 <button type="button" class="btn btn-ghost btn-sm" on:click=move |_| selected.set(None)>
                     "Close"
                 </button>
