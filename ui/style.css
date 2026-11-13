@@ -1,4 +1,13 @@
-/* CafeBlend design tokens (cafeblend-DESIGN.md). */
+/* CafeBlend design system (docs/design.md).
+ *
+ * Part 1 holds every rule of the spec as a reusable class, used or not, so a
+ * new component gets the house style by class name alone.
+ * Part 2 lays out this app with those classes.
+ */
+
+/* ============================== Part 1: design system ============================== */
+
+/* ---------- Fonts (bundled, OFL; see fonts/) ---------- */
 
 @font-face {
     font-family: "DM Serif Display";
@@ -42,18 +51,34 @@
     src: url("/fonts/ibm-plex-mono-500.woff2") format("woff2");
 }
 
+/* ---------- Tokens ---------- */
+
 :root {
+    /* Colors */
     --primary: #8b5e3c;
     --primary-hover: #6b4226;
     --secondary: #c4956a;
+    --tertiary: #fdf6ec;
     --background: #fdf6ec;
     --surface: #ffffff;
     --surface-inset: #f0e6d6;
     --surface-inset-hover: #ebe0d0;
+    --surface-disabled: #f5ede3;
     --wash: #faf0e1;
     --divider: #e8ddd0;
+    --shadow-tone: #d5c9b8;
     --text: #3e2723;
     --text-muted: #6d4c41;
+    /* The spec names text-tertiary without a value. */
+    --text-tertiary: var(--text-muted);
+    --text-on-primary: #ffffff;
+
+    --success: #059669;
+    --warning: #d97706;
+    --error: #ef4444;
+    --error-hover: #dc2626;
+    --error-wash: #fef2f2;
+    --info: #6366f1;
 
     /* Status chips: background from the spec. Text is one step darker than
        the spec so 12px text passes WCAG AA (4.5:1) on its background. */
@@ -66,142 +91,158 @@
     --info-bg: #ede9fe;
     --info-text: #4f46e5;
 
+    /* Typography */
     --font-headline: "DM Serif Display", Georgia, serif;
     --font-body: "Work Sans", system-ui, sans-serif;
     --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+    --type-h1: 400 34px / 42px var(--font-headline);
+    --type-h2: 400 26px / 34px var(--font-headline);
+    --type-h3: 400 20px / 28px var(--font-headline);
+    --type-h4: 400 16px / 24px var(--font-headline);
+    --type-body: 400 14px / 22px var(--font-body);
+    --type-small: 400 12px / 18px var(--font-body);
+    --type-mono: 400 13px / 20px var(--font-mono);
 
+    /* Spacing (8px base) */
     --space-xs: 4px;
     --space-sm: 8px;
     --space-md: 16px;
     --space-lg: 24px;
+    --space-xl: 32px;
+    --space-2xl: 48px;
+    --space-3xl: 64px;
 
+    /* Radius */
+    --radius-none: 0;
     --radius-sm: 6px;
     --radius-md: 12px;
+    --radius-lg: 16px;
     --radius-full: 9999px;
 
-    --shadow-raised: 6px 6px 12px #d5c9b8, -6px -6px 12px #ffffff;
-    --shadow-raised-strong: 8px 8px 16px #d5c9b8, -8px -8px 16px #ffffff;
-    --shadow-inset: inset 4px 4px 8px #d5c9b8, inset -4px -4px 8px #ffffff;
+    /* Elevation */
+    --shadow-raised: 6px 6px 12px var(--shadow-tone), -6px -6px 12px #ffffff;
+    --shadow-raised-strong:
+        8px 8px 16px var(--shadow-tone), -8px -8px 16px #ffffff;
+    --shadow-raised-mini: 2px 2px 4px var(--shadow-tone), -2px -2px 4px #ffffff;
+    --shadow-inset:
+        inset 4px 4px 8px var(--shadow-tone), inset -4px -4px 8px #ffffff;
+    --shadow-inset-mini:
+        inset 2px 2px 4px var(--shadow-tone), inset -2px -2px 4px #ffffff;
+    --shadow-sm: 0 2px 4px rgb(0 0 0 / 6%);
+    --shadow-md: 0 4px 12px rgb(0 0 0 / 8%);
+    --shadow-lg: 0 8px 24px rgb(0 0 0 / 12%);
     --shadow-focus: 0 0 0 3px rgb(139 94 60 / 25%);
 }
+
+/* ---------- Base ---------- */
 
 * {
     box-sizing: border-box;
 }
 
-html,
 body {
-    height: 100%;
     margin: 0;
-}
-
-body {
     background: var(--background);
     color: var(--text);
-    font: 400 14px / 22px var(--font-body);
+    font: var(--type-body);
 }
 
-/* Layout: toolbar on the cream background, packet card below. */
-
-.app {
-    display: grid;
-    grid-template-rows: auto 1fr;
-    gap: var(--space-lg);
-    height: 100%;
-    padding: var(--space-lg);
-}
-
-.toolbar {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: flex-end;
-    gap: var(--space-lg);
-}
-
-.brand {
-    margin-right: auto;
-}
-
-.brand h1 {
+/* Do's and Don'ts: at most two headline sizes per page. */
+h1,
+.h1 {
     margin: 0;
     color: var(--primary);
-    font: 400 26px / 34px var(--font-headline);
+    font: var(--type-h1);
 }
 
-.brand p {
+h2,
+.h2 {
     margin: 0;
+    color: var(--primary);
+    font: var(--type-h2);
+}
+
+h3,
+.h3 {
+    margin: 0;
+    font: var(--type-h3);
+}
+
+h4,
+.h4 {
+    margin: 0;
+    font: var(--type-h4);
+}
+
+p {
+    margin: 0;
+}
+
+.text-small {
+    font: var(--type-small);
+}
+
+.text-muted {
     color: var(--text-muted);
-    font-size: 12px;
-    line-height: 18px;
 }
 
-.controls {
-    display: flex;
-    align-items: flex-end;
-    gap: var(--space-md);
+.mono,
+code,
+kbd {
+    font: var(--type-mono);
 }
 
-/* Inputs */
-
-.field {
-    display: flex;
-    flex-direction: column;
-}
-
-.field-label {
-    margin-bottom: 6px;
-    font-weight: 500;
-}
-
-.input {
-    appearance: none;
-    height: 42px;
-    min-width: 160px;
-    padding: 10px 40px 10px 14px;
-    border: none;
-    border-radius: var(--radius-md);
-    background-color: var(--surface-inset);
-    /* Chevron in --primary; the native GTK arrow ignores the theme. */
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%238b5e3c' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
-    background-position: right 16px center;
-    background-repeat: no-repeat;
-    box-shadow: var(--shadow-inset);
-    color: var(--text);
-    font: inherit;
-}
-
-.input:hover:not(:disabled) {
-    background-color: var(--surface-inset-hover);
-}
-
-.input:disabled {
-    background-color: #f5ede3;
-    box-shadow: none;
-    cursor: not-allowed;
-}
-
-.input:focus-visible {
+:focus-visible {
     outline: none;
-    box-shadow: var(--shadow-inset), var(--shadow-focus);
+    box-shadow: var(--shadow-focus);
 }
 
-/* Buttons */
+/* Hidden on screen, still read by screen readers. */
+.visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+}
+
+/* ---------- Buttons ---------- */
 
 .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-sm);
     height: 42px;
     padding: 8px 18px;
     border: none;
     border-radius: var(--radius-md);
+    background: transparent;
     box-shadow: var(--shadow-raised);
     font: 500 14px / 22px var(--font-body);
     cursor: pointer;
 }
 
+.btn-sm {
+    height: 34px;
+    padding: 6px 14px;
+    font-size: 12px;
+    line-height: 18px;
+}
+
+.btn-lg {
+    height: 50px;
+    padding: 10px 24px;
+    font-size: 16px;
+    line-height: 24px;
+}
+
 .btn:focus-visible {
-    outline: none;
     box-shadow: var(--shadow-raised), var(--shadow-focus);
 }
 
+/* Neumorphic buttons flatten on press. */
 .btn:active:not(:disabled) {
     box-shadow: none;
     transform: translateY(1px);
@@ -215,7 +256,7 @@ body {
 
 .btn-primary {
     background: var(--primary);
-    color: #ffffff;
+    color: var(--text-on-primary);
 }
 
 .btn-primary:hover:not(:disabled) {
@@ -231,185 +272,450 @@ body {
     box-shadow: var(--shadow-raised-strong);
 }
 
-/* Chips */
+.btn-ghost {
+    background: transparent;
+    box-shadow: none;
+    color: var(--text-muted);
+}
+
+.btn-ghost:hover:not(:disabled) {
+    background: var(--wash);
+}
+
+.btn-destructive {
+    background: var(--error);
+    color: var(--text-on-primary);
+}
+
+.btn-destructive:hover:not(:disabled) {
+    background: var(--error-hover);
+}
+
+/* ---------- Cards ---------- */
+
+/* Neumorphic cards sit on the cream background for the full shadow effect. */
+.card {
+    padding: var(--space-lg);
+    border: none;
+    border-radius: var(--radius-md);
+    background: var(--surface);
+    box-shadow: var(--shadow-raised);
+}
+
+.card-elevated {
+    box-shadow: var(--shadow-md);
+}
+
+.card-media {
+    display: block;
+    width: calc(100% + 2 * var(--space-lg));
+    margin: calc(-1 * var(--space-lg)) calc(-1 * var(--space-lg))
+        var(--space-lg);
+    border-radius: var(--radius-md) var(--radius-md) 0 0;
+}
+
+.panel {
+    border-radius: var(--radius-lg);
+}
+
+.modal {
+    padding: var(--space-lg);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+    box-shadow: var(--shadow-lg);
+}
+
+/* ---------- Inputs ---------- */
+
+.field {
+    display: flex;
+    flex-direction: column;
+}
+
+.field-label {
+    margin-bottom: 6px;
+    color: var(--text);
+    font: 500 14px / 22px var(--font-body);
+}
+
+.field-helper {
+    margin-top: var(--space-xs);
+    color: var(--text-tertiary);
+    font: var(--type-small);
+}
+
+.input {
+    appearance: none;
+    width: 100%;
+    height: 42px;
+    padding: 10px 14px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-md);
+    background-color: var(--surface-inset);
+    box-shadow: var(--shadow-inset);
+    color: var(--text);
+    font: var(--type-body);
+}
+
+.input::placeholder {
+    color: var(--text-tertiary);
+    opacity: 0.8;
+}
+
+.input:hover:not(:disabled) {
+    background-color: var(--surface-inset-hover);
+}
+
+.input:focus-visible {
+    background-color: var(--surface-inset);
+    box-shadow: var(--shadow-inset), var(--shadow-focus);
+}
+
+/* Error state switches to a bordered, flat style (Do's and Don'ts #7). */
+.input[aria-invalid="true"],
+.input.is-error {
+    border-color: var(--error);
+    background-color: var(--error-wash);
+    box-shadow: none;
+}
+
+.field-helper.is-error {
+    color: var(--error-text);
+}
+
+.input:disabled,
+.input[aria-disabled="true"] {
+    background-color: var(--surface-disabled);
+    box-shadow: none;
+    cursor: not-allowed;
+}
+
+/* ---------- Select (themed dropdown) ----------
+ * WebKitGTK draws the popup of a native <select> with GTK, which CSS cannot
+ * reach. Use .select: an .input trigger button plus a .menu listbox.
+ */
+
+.select {
+    position: relative;
+}
+
+.select-trigger {
+    display: flex;
+    align-items: center;
+    padding-right: 40px;
+    text-align: left;
+    cursor: pointer;
+}
+
+.select-trigger::after {
+    position: absolute;
+    top: 50%;
+    right: 16px;
+    width: 12px;
+    height: 8px;
+    margin-top: -4px;
+    background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%238b5e3c' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E")
+        no-repeat;
+    content: "";
+}
+
+.select-value {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.menu {
+    position: absolute;
+    z-index: 20;
+    top: calc(100% + var(--space-sm));
+    left: 0;
+    min-width: 100%;
+    max-height: 280px;
+    margin: 0;
+    padding: var(--space-xs);
+    overflow-y: auto;
+    border-radius: var(--radius-md);
+    background: var(--surface);
+    box-shadow: var(--shadow-md);
+    list-style: none;
+}
+
+.menu-item {
+    display: flex;
+    align-items: center;
+    min-height: 36px;
+    padding: 6px 12px;
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.menu-item:hover,
+.menu-item.is-active {
+    background: var(--wash);
+}
+
+.menu-item[aria-selected="true"] {
+    color: var(--primary);
+    font-weight: 500;
+}
+
+/* ---------- Chips ---------- */
 
 .chip {
     display: inline-flex;
     align-items: center;
     gap: 6px;
     padding: 2px 10px;
+    border: none;
     border-radius: var(--radius-full);
     background: var(--surface-inset);
     color: var(--text-muted);
     font: 500 12px / 18px var(--font-body);
 }
 
-.status-line {
-    display: flex;
-    align-items: center;
-    gap: var(--space-md);
-    width: 100%;
+.chip-filter {
+    padding: 6px 14px;
+    background: var(--wash);
+    box-shadow: var(--shadow-raised-mini);
+    color: var(--primary);
+    cursor: pointer;
 }
 
-.status {
-    padding: 4px 12px;
+.chip-filter[aria-pressed="true"] {
+    box-shadow: var(--shadow-inset-mini);
 }
 
-.status::before {
-    width: 8px;
-    height: 8px;
-    border-radius: var(--radius-full);
-    background: currentColor;
-    content: "";
-}
-
-.status[data-state="capturing"] {
+.chip-success {
     background: var(--success-bg);
     color: var(--success-text);
 }
 
-.status[data-state="pending"] {
+.chip-warning {
     background: var(--warning-bg);
     color: var(--warning-text);
 }
 
-.status[data-state="error"] {
+.chip-error {
     background: var(--error-bg);
     color: var(--error-text);
 }
 
-.count {
-    color: var(--text-muted);
-    font: 400 13px / 20px var(--font-mono);
-}
-
-.proto[data-proto="TCP"] {
-    background: var(--wash);
-    color: var(--primary);
-}
-
-.proto[data-proto="UDP"] {
+.chip-info {
     background: var(--info-bg);
     color: var(--info-text);
 }
 
-.proto[data-proto^="ICMP"] {
-    background: var(--warning-bg);
-    color: var(--warning-text);
+/* ---------- Lists ---------- */
+
+.list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
 }
 
-.proto[data-proto="ARP"] {
-    background: var(--success-bg);
-    color: var(--success-text);
-}
-
-/* Packet card */
-
-.packets {
-    min-height: 0;
-    overflow: hidden;
-    border-radius: var(--radius-md);
-    background: var(--surface);
-    box-shadow: var(--shadow-raised);
-}
-
-.table-scroll {
-    height: 100%;
-    overflow: auto;
-}
-
-.table-scroll:focus-visible {
-    outline: none;
-    box-shadow: inset var(--shadow-focus);
-}
-
-.table-scroll::-webkit-scrollbar {
-    width: 10px;
-    height: 10px;
-}
-
-.table-scroll::-webkit-scrollbar-thumb {
-    border: 2px solid var(--surface);
-    border-radius: var(--radius-full);
-    background: var(--secondary);
-}
-
-table {
-    width: 100%;
-    border-collapse: separate;
-    border-spacing: 0;
-}
-
-th {
-    position: sticky;
-    top: 0;
-    z-index: 1;
+.list-item {
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+    min-height: 52px;
     padding: 12px 16px;
     border-bottom: 1px solid var(--divider);
-    background: var(--surface);
-    color: var(--text-muted);
-    font-size: 12px;
-    font-weight: 600;
-    letter-spacing: 0.04em;
-    line-height: 18px;
-    text-align: left;
-    text-transform: uppercase;
+    font: var(--type-body);
 }
 
-td {
-    height: 40px;
-    padding: 0 16px;
-    border-bottom: 1px solid var(--divider);
-    font: 400 13px / 20px var(--font-mono);
-    white-space: nowrap;
-}
-
-.num {
-    text-align: right;
-    font-variant-numeric: tabular-nums;
-}
-
-tbody tr {
-    cursor: default;
-}
-
-tbody tr:hover {
+.list-item:hover {
     background: var(--wash);
 }
 
-tbody tr.selected {
+.list-item.is-selected,
+.list-item[aria-selected="true"] {
     background: var(--surface-inset);
-}
-
-tbody tr.selected td:first-child {
     box-shadow: inset 3px 0 0 var(--primary);
 }
 
-tr.empty td {
-    height: auto;
-    padding: 48px 16px;
-    color: var(--text-muted);
-    font-family: var(--font-body);
-    text-align: center;
-    white-space: normal;
+/* ---------- Checkboxes and radio buttons ---------- */
+
+.check {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-sm);
+    font: var(--type-body);
 }
 
-/* Motion only when the user has not asked to reduce it. */
+.checkbox,
+.radio {
+    appearance: none;
+    display: inline-grid;
+    place-content: center;
+    width: 18px;
+    height: 18px;
+    margin: 0;
+    background: var(--surface-inset);
+    box-shadow: var(--shadow-inset-mini);
+    cursor: pointer;
+}
+
+.checkbox {
+    border-radius: var(--radius-sm);
+}
+
+.checkbox:checked,
+.checkbox:indeterminate {
+    background: var(--primary);
+    box-shadow: var(--shadow-raised-mini);
+}
+
+.checkbox:checked::after {
+    width: 5px;
+    height: 9px;
+    margin-top: -2px;
+    border: solid #ffffff;
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+    content: "";
+}
+
+.checkbox:indeterminate::after {
+    width: 8px;
+    height: 2px;
+    background: #ffffff;
+    content: "";
+}
+
+.radio {
+    border-radius: var(--radius-full);
+}
+
+.radio:checked {
+    border: 2px solid var(--primary);
+    box-shadow: var(--shadow-raised-mini);
+}
+
+.radio:checked::after {
+    width: 10px;
+    height: 10px;
+    border-radius: var(--radius-full);
+    background: var(--primary);
+    content: "";
+}
+
+.checkbox:disabled,
+.radio:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+/* ---------- Tooltips ---------- */
+
+.tooltip {
+    position: fixed;
+    z-index: 30;
+    max-width: 220px;
+    padding: 8px 12px;
+    border-radius: 8px;
+    background: var(--text);
+    box-shadow: var(--shadow-md);
+    color: #ffffff;
+    font: var(--type-small);
+    pointer-events: none;
+}
+
+/* 6px arrow. data-side says where the tooltip sits relative to its anchor,
+   data-align which edge the arrow sits near. */
+.tooltip::before {
+    position: absolute;
+    left: 16px;
+    border: 6px solid transparent;
+    content: "";
+}
+
+.tooltip[data-side="bottom"]::before {
+    bottom: 100%;
+    border-bottom-color: var(--text);
+}
+
+.tooltip[data-side="top"]::before {
+    top: 100%;
+    border-top-color: var(--text);
+}
+
+.tooltip[data-align="end"]::before {
+    right: 16px;
+    left: auto;
+}
+
+/* ---------- Tabs (worksheet style, on top of a card) ---------- */
+
+.tabs {
+    display: flex;
+    align-items: flex-end;
+    gap: var(--space-xs);
+}
+
+.tab {
+    position: relative;
+    height: 38px;
+    padding: 8px 18px;
+    border: none;
+    border-radius: var(--radius-md) var(--radius-md) 0 0;
+    background: var(--surface-inset);
+    color: var(--text-muted);
+    font: 500 14px / 22px var(--font-body);
+    cursor: pointer;
+}
+
+.tab:hover {
+    background: var(--surface-inset-hover);
+}
+
+/* The active tab joins the card below it, like a worksheet tab. */
+.tab[aria-selected="true"] {
+    z-index: 1;
+    height: 44px;
+    padding-bottom: 14px;
+    margin-bottom: -6px;
+    background: var(--surface);
+    box-shadow: -6px -6px 12px #ffffff;
+    color: var(--primary);
+}
+
+.tab-count {
+    margin-left: var(--space-sm);
+    color: var(--text-tertiary);
+    font: var(--type-small);
+}
+
+/* ---------- Status dot ---------- */
+
+.dot {
+    display: inline-block;
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: var(--radius-full);
+    background: var(--shadow-tone);
+}
+
+/* ---------- Motion (only when the user has not asked to reduce it) ---------- */
 
 @media (prefers-reduced-motion: no-preference) {
-    .btn {
+    .btn,
+    .input,
+    .tab,
+    .chip-filter {
         transition:
             background-color 150ms ease,
             box-shadow 150ms ease,
             transform 150ms ease;
     }
+}
 
-    .status[data-state="capturing"]::before {
-        animation: pulse 1.6s ease-in-out infinite;
-    }
-
-    tbody tr {
-        animation: arrive 600ms ease-out;
+@keyframes pulse {
+    50% {
+        opacity: 0.3;
     }
 }
 
@@ -419,8 +725,445 @@ tr.empty td {
     }
 }
 
-@keyframes pulse {
-    50% {
-        opacity: 0.3;
+/* ============================== Part 2: app layout ============================== */
+
+html,
+body {
+    height: 100%;
+}
+
+.app {
+    display: grid;
+    grid-template-rows: auto auto 1fr;
+    height: 100%;
+    padding: var(--space-lg);
+}
+
+.toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--space-lg);
+    margin-bottom: var(--space-lg);
+}
+
+.brand {
+    margin-right: auto;
+}
+
+.brand h1 {
+    font: var(--type-h2);
+}
+
+.brand p {
+    color: var(--text-muted);
+    font: var(--type-small);
+}
+
+.controls {
+    display: flex;
+    align-items: flex-end;
+    gap: var(--space-md);
+}
+
+.controls .select {
+    width: 200px;
+}
+
+.status-line {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    width: 100%;
+    color: var(--text-muted);
+    font: var(--type-small);
+}
+
+.status {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-sm);
+}
+
+.status[data-state="pending"] .dot {
+    background: var(--secondary);
+}
+
+.status[data-state="capturing"] .dot {
+    background: var(--primary);
+}
+
+.status[data-state="error"] {
+    color: var(--error-text);
+}
+
+.status[data-state="error"] .dot {
+    background: var(--error);
+}
+
+.status-line .count {
+    margin-left: auto;
+    font: var(--type-mono);
+}
+
+/* Tabs on the left, filter on the right, both on the cream background. */
+.sheet-bar {
+    display: flex;
+    align-items: flex-end;
+    gap: var(--space-md);
+    /* Filter height plus its margin: the card stays put when the filter hides. */
+    min-height: 58px;
+}
+
+.filter {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    margin: 0 0 var(--space-md) auto;
+}
+
+.filter > .input {
+    width: 260px;
+}
+
+.filter .select {
+    width: 150px;
+}
+
+.filter-count {
+    min-width: 96px;
+    color: var(--text-muted);
+    font: var(--type-small);
+    text-align: right;
+}
+
+.sheet {
+    min-height: 0;
+    overflow: hidden;
+    padding: 0;
+}
+
+.sheet[data-first-tab="true"] {
+    border-top-left-radius: 0;
+}
+
+.sheet > [role="tabpanel"] {
+    height: 100%;
+}
+
+/* ---------- Packet table ---------- */
+
+.table-scroll {
+    height: 100%;
+    overflow: auto;
+}
+
+.table-scroll:focus-visible {
+    box-shadow: inset var(--shadow-focus);
+}
+
+.table-scroll::-webkit-scrollbar,
+.log::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+.table-scroll::-webkit-scrollbar-thumb,
+.log::-webkit-scrollbar-thumb {
+    border: 2px solid var(--surface);
+    border-radius: var(--radius-full);
+    background: var(--secondary);
+}
+
+.packets {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+}
+
+.packets th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--divider);
+    background: var(--surface);
+    color: var(--text-muted);
+    font: 600 12px / 18px var(--font-body);
+    letter-spacing: 0.04em;
+    text-align: left;
+    text-transform: uppercase;
+}
+
+/* Lists spec: 52px rows. Packet rows use 40px so more fit on screen. */
+.packets td {
+    height: 40px;
+    padding: 0 16px;
+    border-bottom: 1px solid var(--divider);
+    font: var(--type-mono);
+    white-space: nowrap;
+}
+
+.packets .num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+.packets .proto {
+    color: var(--primary);
+    font-weight: 500;
+}
+
+.packets tbody tr {
+    cursor: default;
+}
+
+.packets tbody tr:hover {
+    background: var(--wash);
+}
+
+.packets tbody tr.selected {
+    background: var(--surface-inset);
+}
+
+.packets tbody tr.selected td:first-child {
+    box-shadow: inset 3px 0 0 var(--primary);
+}
+
+.packets tr.empty td {
+    height: auto;
+    padding: var(--space-2xl) var(--space-md);
+    color: var(--text-muted);
+    font: var(--type-body);
+    text-align: center;
+    white-space: normal;
+}
+
+/* ---------- Packet hover card ---------- */
+
+/* Wider than the plain tooltip: it carries a chart and IPv6 addresses. */
+.tooltip-rich {
+    width: 380px;
+    max-width: 380px;
+    padding: 12px 14px;
+}
+
+.tooltip-rich h4 {
+    margin-bottom: var(--space-xs);
+    color: #ffffff;
+    font: 500 13px / 20px var(--font-mono);
+    word-break: break-all;
+}
+
+.tip-grid {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 2px var(--space-md);
+    margin: var(--space-sm) 0;
+}
+
+.tip-grid dt {
+    color: var(--secondary);
+}
+
+.tip-grid dd {
+    margin: 0;
+    font-family: var(--font-mono);
+    word-break: break-all;
+}
+
+.tip-section {
+    margin-top: var(--space-sm);
+    padding-top: var(--space-sm);
+    border-top: 1px solid rgb(255 255 255 / 15%);
+}
+
+.tip-title {
+    margin-bottom: var(--space-xs);
+    color: var(--secondary);
+    font-weight: 500;
+}
+
+.tip-chart {
+    display: block;
+    width: 100%;
+    height: auto;
+}
+
+.tip-chart text {
+    fill: rgb(255 255 255 / 70%);
+    font: 400 10px var(--font-mono);
+}
+
+.tip-legend {
+    display: flex;
+    gap: var(--space-md);
+    margin-top: var(--space-xs);
+}
+
+.tip-legend span::before {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    margin-right: 6px;
+    border-radius: 2px;
+    background: var(--legend);
+    content: "";
+}
+
+.tip-related {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    font-family: var(--font-mono);
+}
+
+.tip-related li {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tip-related .is-current {
+    color: var(--secondary);
+}
+
+/* ---------- Graph page ---------- */
+
+.graph-page {
+    display: grid;
+    grid-template-columns: 1fr 340px;
+    height: 100%;
+    min-height: 0;
+}
+
+.graph-canvas {
+    position: relative;
+    min-height: 0;
+    padding: var(--space-md);
+}
+
+.graph-canvas svg {
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+
+.graph-empty {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-content: center;
+    color: var(--text-muted);
+}
+
+.edge {
+    fill: none;
+    stroke: var(--shadow-tone);
+}
+
+.edge[data-rel="connects"] {
+    stroke-dasharray: 4 4;
+}
+
+.edge[data-rel="direct"] {
+    stroke: var(--secondary);
+}
+
+.node-host circle {
+    fill: var(--primary);
+}
+
+.node-service rect {
+    fill: var(--wash);
+    stroke: var(--secondary);
+}
+
+.node-label {
+    fill: var(--text);
+    font: var(--type-small);
+    font-family: var(--font-mono);
+}
+
+.node-service .node-label {
+    fill: var(--primary);
+}
+
+.graph-side {
+    display: grid;
+    grid-template-rows: auto auto 1fr;
+    min-height: 0;
+    border-left: 1px solid var(--divider);
+}
+
+.ontology {
+    padding: var(--space-md);
+    border-bottom: 1px solid var(--divider);
+}
+
+.ontology h3 {
+    margin-bottom: var(--space-sm);
+}
+
+.ontology dl {
+    display: grid;
+    grid-template-columns: 28px 1fr auto;
+    align-items: center;
+    gap: var(--space-xs) var(--space-sm);
+    margin: 0;
+}
+
+.ontology dt svg {
+    display: block;
+}
+
+.ontology dd {
+    margin: 0;
+}
+
+.ontology .term {
+    font-weight: 500;
+}
+
+.ontology .def {
+    color: var(--text-muted);
+    font: var(--type-small);
+}
+
+.ontology .total {
+    font: var(--type-mono);
+    text-align: right;
+}
+
+.log-head {
+    padding: var(--space-md) var(--space-md) var(--space-sm);
+}
+
+.log {
+    min-height: 0;
+    overflow-y: auto;
+}
+
+.log .list-item {
+    min-height: 40px;
+    padding: 8px 16px;
+    font: var(--type-small);
+}
+
+.log time {
+    flex: none;
+    color: var(--text-muted);
+    font: var(--type-mono);
+    font-size: 12px;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+    .status[data-state="capturing"] .dot {
+        animation: pulse 1.6s ease-in-out infinite;
+    }
+
+    .packets tbody tr,
+    .log .list-item {
+        animation: arrive 600ms ease-out;
     }
 }

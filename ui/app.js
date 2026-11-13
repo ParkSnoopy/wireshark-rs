@@ -1,8 +1,9 @@
-// Visual helpers for the packet table: row selection and follow-the-tail
-// scrolling. Leptos owns the rows; this file only adds classes and scrolls.
+// Visual helpers for the packet table: row selection, and a stable view while
+// new packets enter at the top. Leptos owns the rows; this file only adds
+// classes and scrolls.
 
-/** Distance in px from the bottom that still counts as "at the bottom". */
-const FOLLOW_SLACK = 8;
+/** Scroll offset in px that still counts as "at the top". */
+const TOP_SLACK = 4;
 
 function setup() {
     const scroller = document.querySelector(".table-scroll");
@@ -11,19 +12,30 @@ function setup() {
         return false;
     }
 
-    // Follow new packets only while the user is at the bottom of the list.
-    let following = true;
-    scroller.addEventListener(
-        "scroll",
-        () => {
-            const bottom = scroller.scrollHeight - scroller.clientHeight;
-            following = scroller.scrollTop >= bottom - FOLLOW_SLACK;
-        },
-        { passive: true },
-    );
+    // At the top, new packets push the list down so the newest stay visible.
+    // Scrolled down, the first visible row stays where the user left it.
+    let anchor = null;
+    let anchorTop = 0;
+    const pickAnchor = () => {
+        anchor = null;
+        if (scroller.scrollTop <= TOP_SLACK) {
+            return;
+        }
+        const viewTop =
+            scroller.scrollTop + scroller.querySelector("thead").offsetHeight;
+        for (const row of rows.rows) {
+            if (row.offsetTop + row.offsetHeight > viewTop) {
+                anchor = row;
+                anchorTop = row.offsetTop;
+                return;
+            }
+        }
+    };
+    scroller.addEventListener("scroll", pickAnchor, { passive: true });
     new MutationObserver(() => {
-        if (following) {
-            scroller.scrollTop = scroller.scrollHeight;
+        if (anchor?.isConnected) {
+            scroller.scrollTop += anchor.offsetTop - anchorTop;
+            anchorTop = anchor.offsetTop;
         }
     }).observe(rows, { childList: true });
 

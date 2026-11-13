@@ -13,6 +13,9 @@ pub struct Row {
     pub proto: String,
     pub len: u32,
     pub info: String,
+    /// TCP/UDP ports; `None` for other protocols. The UI groups conversations by them.
+    pub sport: Option<u16>,
+    pub dport: Option<u16>,
 }
 
 struct Summary {
@@ -20,6 +23,7 @@ struct Summary {
     dst: String,
     proto: String,
     info: String,
+    ports: Option<(u16, u16)>,
 }
 
 /// `rel_us` is the time since the first packet of the capture.
@@ -42,6 +46,8 @@ pub fn row(no: u64, rel_us: u64, len: u32, ethertype: u16, data: &[u8]) -> Row {
         proto: s.proto,
         len,
         info: s.info,
+        sport: s.ports.map(|p| p.0),
+        dport: s.ports.map(|p| p.1),
     }
 }
 
@@ -52,6 +58,7 @@ impl Summary {
             dst: String::new(),
             proto,
             info: String::new(),
+            ports: None,
         }
     }
 }
@@ -70,12 +77,13 @@ fn ipv4(d: &[u8]) -> Option<Summary> {
     } else {
         &[]
     };
-    let (proto, info) = transport(d[9], l4);
+    let (proto, info, ports) = transport(d[9], l4);
     Some(Summary {
         src: src.to_string(),
         dst: dst.to_string(),
         proto,
         info,
+        ports,
     })
 }
 
@@ -83,12 +91,13 @@ fn ipv6(d: &[u8]) -> Option<Summary> {
     let src = Ipv6Addr::from(<[u8; 16]>::try_from(d.get(8..24)?).ok()?);
     let dst = Ipv6Addr::from(<[u8; 16]>::try_from(d.get(24..40)?).ok()?);
     // shortcut: extension headers are not walked, so they show as "IP proto N"; walk them if that shows up often.
-    let (proto, info) = transport(d[6], &d[40..]);
+    let (proto, info, ports) = transport(d[6], &d[40..]);
     Some(Summary {
         src: src.to_string(),
         dst: dst.to_string(),
         proto,
         info,
+        ports,
     })
 }
 
@@ -112,18 +121,28 @@ fn arp(d: &[u8]) -> Option<Summary> {
         dst: target.to_string(),
         proto: "ARP".into(),
         info,
+        ports: None,
     })
 }
 
-fn transport(proto: u8, d: &[u8]) -> (String, String) {
+/// Returns the protocol name, the info text and the TCP/UDP ports.
+fn transport(proto: u8, d: &[u8]) -> (String, String, Option<(u16, u16)>) {
     let (name, info) = match proto {
         1 => ("ICMP", icmp(d)),
         6 => ("TCP", tcp(d)),
         17 => ("UDP", ports(d)),
         58 => ("ICMPv6", icmp(d)),
-        p => return (format!("IP proto {p}"), String::new()),
+        p => return (format!("IP proto {p}"), String::new(), None),
     };
-    (name.into(), info.unwrap_or_else(|| "truncated".into()))
+    let ports = match proto {
+        6 | 17 => be16(d, 0).zip(be16(d, 2)),
+        _ => None,
+    };
+    (
+        name.into(),
+        info.unwrap_or_else(|| "truncated".into()),
+        ports,
+    )
 }
 
 fn ports(d: &[u8]) -> Option<String> {
@@ -181,6 +200,7 @@ mod tests {
             ("1.500000", "10.0.0.1", "10.0.0.2", "TCP")
         );
         assert_eq!(r.info, "443 → 51234 [SYN, ACK]");
+        assert_eq!((r.sport, r.dport), (Some(443), Some(51234)));
     }
 
     #[test]
@@ -188,7 +208,8 @@ mod tests {
         let mut d = ipv4_header(17);
         d[7] = 0x10; // fragment offset != 0
         d.extend([0, 53, 0, 53]);
-        assert_eq!(row(1, 0, 24, 0x0800, &d).info, "truncated");
+        let r = row(1, 0, 24, 0x0800, &d);
+        assert_eq!((r.info.as_str(), r.sport), ("truncated", None));
     }
 
     #[test]
@@ -202,6 +223,7 @@ mod tests {
             (r.src.as_str(), r.proto.as_str(), r.info.as_str()),
             ("::1", "UDP", "53 → 12345")
         );
+        assert_eq!((r.sport, r.dport), (Some(53), Some(12345)));
     }
 
     #[test]
