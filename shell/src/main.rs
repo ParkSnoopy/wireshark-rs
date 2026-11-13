@@ -25,18 +25,10 @@ const TICK: Duration = Duration::from_millis(100);
 /// Upper bound of rows pushed per tick; the UI keeps the same number.
 const MAX_ROWS: usize = 1000;
 
-const INDEX: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../ui/dist/index.html"
-));
-const JS: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../ui/dist/wireshark-ui.js"
-));
-const WASM: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../ui/dist/wireshark-ui_bg.wasm"
-));
+// Built by build.rs.
+const INDEX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dist/index.html"));
+const JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dist/wireshark-ui.js"));
+const WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dist/wireshark-ui_bg.wasm"));
 
 enum Msg {
     Row(Row),

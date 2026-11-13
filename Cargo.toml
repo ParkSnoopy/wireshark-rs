@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["ui", "shell", "capture"]
-# `cargo run` at the root starts the app. The privileged helper is built
-# separately (it needs setcap after every build anyway).
+members = ["ui", "shell"]
+# `cargo build` at the root builds the app and the capture helper; shell's
+# build.rs builds the wasm UI with trunk. `ui` is never built for the host.
 default-members = ["shell"]
