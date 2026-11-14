@@ -284,8 +284,9 @@ pub struct Body {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct MitmState {
     pub on: bool,
-    pub addr: String,
-    /// Path of the CA certificate file clients must trust.
+    /// Port the redirected traffic reaches the proxy on.
+    pub port: u16,
+    /// Path of the CA certificate file, trusted system-wide while on.
     pub ca: Option<String>,
     pub error: Option<String>,
 }
@@ -539,43 +540,237 @@ impl std::fmt::Display for Cidr {
     }
 }
 
-/// Table filter: every whitespace-separated term must occur in the row
-/// (number, endpoints, host names, protocols, info, process, interface or
-/// scope, case-insensitive). A term like `10.0.0.0/8` matches rows with an
-/// end in that block. The row must also pass the filter dialog's `Rules`.
+/// Table filter: a search expression over the row's text (number,
+/// endpoints, host names, protocols, info, process, interface and scope,
+/// case-insensitive). The row must also pass the filter dialog's `Rules`.
+///
+/// - `a b` or `a & b`: both; `a | b`: either; `&` binds tighter than `|`.
+/// - `!a`: not; `( )` groups; `"a b"` is one term with a space.
+/// - `a`: occurs anywhere; `^a`: a word starts with it; `$a`: a word ends
+///   with it; `=a`: a whole word.
+/// - `10.0.0.0/8`: an end of the row is in that block.
+///
+/// Malformed input is read leniently: a missing `)` closes at the end,
+/// a stray `)` or operator is skipped.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Filter {
-    terms: Vec<String>,
-    nets: Vec<Cidr>,
+    expr: Expr,
     rules: Rules,
     ports: Vec<(u16, u16)>,
 }
 
+/// Parsed search expression.
+#[derive(Clone, Debug, PartialEq)]
+enum Expr {
+    All(Vec<Expr>),
+    Any(Vec<Expr>),
+    Not(Box<Expr>),
+    Term(Term),
+}
+
+impl Default for Expr {
+    fn default() -> Self {
+        Self::All(Vec::new())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Term {
+    Has(String),
+    Starts(String),
+    Ends(String),
+    Word(String),
+    Net(Cidr),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Tok {
+    Or,
+    And,
+    Not,
+    Open,
+    Close,
+    Term(Term),
+}
+
+/// Characters that end an unquoted term.
+fn ends_term(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '|' | '&' | '(' | ')' | '"')
+}
+
+fn tokens(text: &str) -> Vec<Tok> {
+    let mut out = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        match c {
+            c if c.is_whitespace() => {
+                chars.next();
+            }
+            '|' | '&' | '!' | '(' | ')' => {
+                chars.next();
+                out.push(match c {
+                    '|' => Tok::Or,
+                    '&' => Tok::And,
+                    '!' => Tok::Not,
+                    '(' => Tok::Open,
+                    _ => Tok::Close,
+                });
+            }
+            _ => {
+                let mode = match c {
+                    '^' | '$' | '=' => chars.next(),
+                    _ => None,
+                };
+                let mut word = String::new();
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    word.extend(chars.by_ref().take_while(|&c| c != '"'));
+                } else {
+                    while let Some(c) = chars.next_if(|&c| !ends_term(c)) {
+                        word.push(c);
+                    }
+                }
+                let word = word.to_lowercase();
+                let term = match mode {
+                    Some('^') => Term::Starts(word),
+                    Some('$') => Term::Ends(word),
+                    Some(_) => Term::Word(word),
+                    None => Cidr::parse(&word).map_or(Term::Has(word), Term::Net),
+                };
+                // A lone `^` or `""` searches for nothing: skip it.
+                if !matches!(&term, Term::Has(w) | Term::Starts(w) | Term::Ends(w) | Term::Word(w) if w.is_empty())
+                {
+                    out.push(Tok::Term(term));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Recursive descent over `tokens`: or := and ('|' and)*,
+/// and := unary ('&'? unary)*, unary := '!' unary | '(' or ')' | term.
+struct Parser {
+    toks: Vec<Tok>,
+    at: usize,
+}
+
+impl Parser {
+    fn peek(&self) -> Option<&Tok> {
+        self.toks.get(self.at)
+    }
+
+    fn or(&mut self) -> Expr {
+        let mut any = vec![self.and()];
+        while self.peek() == Some(&Tok::Or) {
+            self.at += 1;
+            any.push(self.and());
+        }
+        flatten(any, Expr::Any)
+    }
+
+    fn and(&mut self) -> Expr {
+        let mut all = Vec::new();
+        loop {
+            match self.peek() {
+                None | Some(Tok::Or | Tok::Close) => break,
+                Some(Tok::And) => self.at += 1,
+                Some(_) => all.extend(self.unary()),
+            }
+        }
+        flatten(all, Expr::All)
+    }
+
+    fn unary(&mut self) -> Option<Expr> {
+        let tok = self.peek()?.clone();
+        self.at += 1;
+        match tok {
+            Tok::Not => self.unary().map(|e| Expr::Not(Box::new(e))),
+            Tok::Open => {
+                let e = self.or();
+                if self.peek() == Some(&Tok::Close) {
+                    self.at += 1;
+                }
+                Some(e)
+            }
+            Tok::Term(t) => Some(Expr::Term(t)),
+            Tok::Or | Tok::And | Tok::Close => None,
+        }
+    }
+}
+
+/// Drops empty operands (as in `a |` or `()`); one operand stands for
+/// itself; nothing left matches every row.
+fn flatten(mut items: Vec<Expr>, make: fn(Vec<Expr>) -> Expr) -> Expr {
+    items.retain(|e| *e != Expr::default());
+    match items.len() {
+        0 => Expr::default(),
+        1 => items.pop().expect("one item"),
+        _ => make(items),
+    }
+}
+
+impl Expr {
+    fn parse(text: &str) -> Self {
+        let mut p = Parser {
+            toks: tokens(text),
+            at: 0,
+        };
+        let mut all = Vec::new();
+        // A stray `)` ends `or` early: skip it and read on.
+        while p.peek().is_some() {
+            all.push(p.or());
+            if p.peek() == Some(&Tok::Close) {
+                p.at += 1;
+            }
+        }
+        flatten(all, Expr::All)
+    }
+
+    fn matches(&self, r: &Row) -> bool {
+        match self {
+            Self::All(v) => v.iter().all(|e| e.matches(r)),
+            Self::Any(v) => v.iter().any(|e| e.matches(r)),
+            Self::Not(e) => !e.matches(r),
+            Self::Term(t) => t.matches(r),
+        }
+    }
+}
+
+impl Term {
+    fn matches(&self, r: &Row) -> bool {
+        // Word edges in the search text: spaces, brackets and `#`.
+        let starts = |i: usize| i == 0 || r.search[..i].ends_with([' ', '[', '(', '#']);
+        let ends = |j: usize| j == r.search.len() || r.search[j..].starts_with([' ', ']', ')']);
+        let any_at = |w: &str, ok: &dyn Fn(usize, usize) -> bool| {
+            r.search
+                .char_indices()
+                .any(|(i, _)| r.search[i..].starts_with(w) && ok(i, i + w.len()))
+        };
+        match self {
+            Self::Has(w) => r.search.contains(w.as_str()),
+            Self::Starts(w) => any_at(w, &|i, _| starts(i)),
+            Self::Ends(w) => any_at(w, &|_, j| ends(j)),
+            Self::Word(w) => any_at(w, &|i, j| starts(i) && ends(j)),
+            Self::Net(n) => [r.src_ip, r.dst_ip]
+                .into_iter()
+                .flatten()
+                .any(|ip| n.contains(ip)),
+        }
+    }
+}
+
 impl Filter {
     pub fn new(text: &str, rules: &Rules) -> Self {
-        let (nets, terms): (Vec<&str>, Vec<&str>) = text
-            .split_whitespace()
-            .partition(|t| Cidr::parse(t).is_some());
         Self {
-            terms: terms.into_iter().map(str::to_lowercase).collect(),
-            nets: nets.into_iter().filter_map(Cidr::parse).collect(),
+            expr: Expr::parse(text),
             ports: port_ranges(&rules.ports),
             rules: rules.clone(),
         }
     }
 
     pub fn matches(&self, r: &Row) -> bool {
-        let in_net = |n: &Cidr| {
-            [r.src_ip, r.dst_ip]
-                .into_iter()
-                .flatten()
-                .any(|ip| n.contains(ip))
-        };
-        if !self.nets.iter().all(in_net) {
-            return false;
-        }
-        self.rules.matches(r, &self.ports)
-            && self.terms.iter().all(|t| r.search.contains(t.as_str()))
+        self.rules.matches(r, &self.ports) && self.expr.matches(r)
     }
 }
 
@@ -1151,6 +1346,39 @@ mod tests {
             ..only("UDP")
         };
         assert!(!Filter::new("", &hide_udp).matches(&r));
+    }
+
+    #[test]
+    fn search_operators() {
+        let mut r = row(7, "fe80::1", Some(53), "10.0.0.2", Some(5353), "UDP");
+        r.dproc = Some("firefox".into());
+        let r = r.prepared();
+        let pass = |q: &str| Filter::new(q, &Rules::default()).matches(&r);
+        // Or, and, precedence: `&` binds tighter than `|`.
+        assert!(pass("tcp | udp"));
+        assert!(!pass("tcp | ssh"));
+        assert!(pass("tcp & ssh | firefox"));
+        assert!(!pass("tcp & (ssh | firefox)"));
+        assert!(pass("udp&firefox"));
+        // Not, and grouping with it.
+        assert!(pass("!tcp"));
+        assert!(!pass("!(udp | tcp)"));
+        assert!(pass("udp !chrome"));
+        // Starts with, ends with and whole word, at bracket and port edges.
+        assert!(pass("^10.0") && pass("^fe80") && pass("^fire"));
+        assert!(!pass("^0.0.2") && !pass("^efox"));
+        assert!(pass("$fox") && pass("$:5353") && pass("$fe80::1"));
+        assert!(!pass("$fire"));
+        assert!(pass("=udp") && pass("=fe80::1") && !pass("=fire"));
+        // Quotes keep a space and the operator characters inside.
+        assert!(pass("\":5353 udp\"") && !pass("\":5353 tcp\""));
+        assert!(!pass("\"udp | tcp\""));
+        // CIDR terms take part in the expression.
+        assert!(pass("192.168.0.0/16 | 10.0.0.0/8"));
+        assert!(!pass("!10.0.0.0/8"));
+        // Lenient on malformed input.
+        assert!(pass("(udp") && pass("udp )") && pass("| udp |") && pass("^"));
+        assert!(pass("") && pass("()"));
     }
 
     #[test]

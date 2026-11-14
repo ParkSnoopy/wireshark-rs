@@ -1,6 +1,6 @@
 //! Packet capture inside the unprivileged shell.
 //!
-//! `request_socket` runs the helper once through pkexec and receives an
+//! `helper::launch` runs the helper once through pkexec and receives an
 //! unbound AF_PACKET socket. A capture binds that socket to one interface
 //! and reads it on a thread; stopping binds it to protocol 0 again, which
 //! stops delivery. The shell never holds root or a capability.
@@ -9,10 +9,9 @@
 //! names and host names, and the recording keeps them for export.
 
 use std::ffi::CString;
-use std::io::{self, Read};
+use std::io;
 use std::mem;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::process::{Command, Stdio};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -23,9 +22,6 @@ use crate::export::{Recording, SNAPLEN};
 use crate::owners::Owners;
 use crate::parse::{self, Row};
 
-const HELPER: &str = "wireshark-capture";
-/// Absolute path: never search PATH for the program that grants root.
-const PKEXEC: &str = "/usr/bin/pkexec";
 const ETH_P_ALL: u16 = 0x0003;
 
 pub struct Capture {
@@ -37,54 +33,6 @@ pub struct Capture {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     socket: Arc<OwnedFd>,
-}
-
-/// Runs the helper through pkexec and returns the socket it sends.
-/// Blocks until the user answers the authorization dialog.
-pub fn request_socket() -> io::Result<OwnedFd> {
-    let mut fds = [0; 2];
-    // SAFETY: fds has room for the two descriptors socketpair writes.
-    if unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-            0,
-            fds.as_mut_ptr(),
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: socketpair returned two new descriptors that nothing else owns.
-    let (ours, theirs) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-
-    // Run only the helper installed next to this binary. pkexec needs an absolute path.
-    let helper = std::env::current_exe()?.with_file_name(HELPER);
-    // pkexec closes every descriptor above 2, so the socket goes in as stdout.
-    let mut child = Command::new(PKEXEC)
-        .arg(helper)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(theirs))
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| io::Error::other(format!("cannot run {PKEXEC}: {e}")))?;
-    let mut stderr = String::new();
-    child
-        .stderr
-        .take()
-        .expect("stderr is piped")
-        .read_to_string(&mut stderr)?;
-    let status = child.wait()?;
-
-    match recv_fd(&ours) {
-        Ok(fd) => Ok(fd),
-        // pkexec exits 126 when the dialog is dismissed and 127 when not authorized.
-        Err(_) if !status.success() => Err(io::Error::other(match stderr.trim() {
-            "" => format!("capture permission not granted ({status})"),
-            text => text.to_owned(),
-        })),
-        Err(e) => Err(e),
-    }
 }
 
 impl Capture {
@@ -256,50 +204,6 @@ fn bind(socket: &OwnedFd, protocol: u16, index: i32) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
-}
-
-/// Receives one descriptor sent with SCM_RIGHTS.
-fn recv_fd(sock: &OwnedFd) -> io::Result<OwnedFd> {
-    let mut byte = [0u8; 1];
-    let mut iov = libc::iovec {
-        iov_base: byte.as_mut_ptr().cast(),
-        iov_len: 1,
-    };
-    // u64 storage keeps the control buffer aligned for cmsghdr.
-    let mut control = [0u64; 4];
-    // SAFETY: msghdr is a plain C struct; all-zero is a valid value.
-    let mut msg: libc::msghdr = unsafe { mem::zeroed() };
-    msg.msg_iov = &raw mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = mem::size_of_val(&control);
-    // The helper has exited, so a missing message means it sent nothing.
-    // SAFETY: msg and everything it points to stay valid during the call.
-    let n = unsafe {
-        libc::recvmsg(
-            sock.as_raw_fd(),
-            &raw mut msg,
-            libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
-        )
-    };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: recvmsg filled msg; CMSG_FIRSTHDR returns null or a header inside control.
-    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&raw const msg) };
-    // SAFETY: cmsg is checked for null before it is read.
-    let ok = !cmsg.is_null()
-        && unsafe {
-            (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS
-        };
-    if !ok {
-        return Err(io::Error::other("the capture helper sent no socket"));
-    }
-    // SAFETY: an SCM_RIGHTS header carries at least one int; the kernel installed
-    // that descriptor in this process and nothing else owns it.
-    Ok(unsafe {
-        OwnedFd::from_raw_fd(libc::CMSG_DATA(cmsg).cast::<libc::c_int>().read_unaligned())
-    })
 }
 
 fn socklen<T>() -> libc::socklen_t {

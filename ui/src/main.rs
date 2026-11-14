@@ -357,7 +357,7 @@ fn App() -> impl IntoView {
                         type="button"
                         class="chip chip-filter mitm-toggle"
                         aria-pressed=move || mitm.with(|m| m.on).to_string()
-                        title="Run an HTTPS proxy that decrypts the traffic of clients you send through it. Off by default."
+                        title="Intercept and decrypt this machine's web traffic: redirects TCP 80 and 443 to this app and trusts its certificate system-wide while on. Off by default."
                         on:click=move |_| {
                             let on = !mitm.with_untracked(|m| m.on);
                             post_message(if on { "mitm on" } else { "mitm off" });
@@ -401,7 +401,8 @@ fn App() -> impl IntoView {
                         <input
                             class="input"
                             type="search"
-                            placeholder="Filter: address, name, port, https, 10.0.0.0/8"
+                            placeholder="Filter: dns | ^10.0 & !udp, 10.0.0.0/8"
+                            title="Terms side by side or joined by & must all match; | means or; ! negates; ( ) groups; ^term starts a word, $term ends a word, =term is a whole word; \"quoted text\" keeps spaces; 10.0.0.0/8 matches an address block."
                             aria-label="Filter packets"
                             prop:value=move || query.get()
                             on:input=move |ev| query.set(event_target_value(&ev))
@@ -460,7 +461,7 @@ fn App() -> impl IntoView {
                     <div class="https-list">
                         <Show when=move || exchanges.with(Vec::is_empty)>
                             <p class="inspector-note">
-                                "No decrypted requests. Turn on the HTTPS proxy, then send a client through it."
+                                "No decrypted requests. Turn on the HTTPS proxy: web traffic from this machine shows here."
                             </p>
                         </Show>
                         // Newest first, like the packet table.
@@ -641,21 +642,18 @@ fn MitmBanner(mitm: RwSignal<MitmState>) -> impl IntoView {
             return None;
         }
         let ca = m.ca.unwrap_or_default();
-        let example = format!(
-            "curl --proxy http://{} --cacert {ca} https://example.com/",
-            m.addr
-        );
         Some(
             view! {
                 <div class="mitm-banner" role="status">
                     <p>
-                        <strong>"HTTPS proxy on at " {m.addr.clone()} "."</strong>
-                        " Clients that use this proxy and trust its certificate send their HTTPS content through this app, which can read it. "
-                        "The certificate is new for each run and stops working when the proxy stops; its key never leaves memory. "
-                        "Nothing else is changed: no system proxy, no system trust store."
+                        <strong>"HTTPS interception is on."</strong>
+                        " All web traffic of this machine (TCP ports 80 and 443) goes through this app, which can read it. "
+                        "Its certificate is trusted system-wide until you turn this off or close the app; its key never leaves memory. "
+                        "QUIC is blocked so browsers use TCP."
                     </p>
                     <p class="mitm-example">
-                        "Certificate: " <code>{ca}</code> " · Try: " <code>{example}</code>
+                        "Certificate: " <code>{ca}</code>
+                        " · Firefox and Chrome keep their own trust lists: import this file there to decrypt them."
                     </p>
                 </div>
             }

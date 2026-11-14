@@ -1,16 +1,21 @@
-//! HTTPS interception: an HTTP proxy on 127.0.0.1 that decrypts the HTTPS
-//! requests sent through it, with certificates signed by a CA made when
-//! the proxy starts.
+//! HTTPS interception: a transparent proxy that decrypts the web traffic
+//! the kernel redirects to it, with certificates signed by a CA made when
+//! interception starts.
 //!
-//! Clients opt in: they must use the proxy and trust the CA certificate.
-//! The CA key lives only in memory, so the certificate is worthless once the
-//! proxy stops. The proxy still checks each server's real certificate
+//! Clients are not configured. The helper redirects this machine's TCP to
+//! ports 80 and 443 to `PORT` and adds the CA to the system trust store;
+//! the proxy reads where each connection was going (`SO_ORIGINAL_DST`) and
+//! the host name from the TLS server name or the `Host` header. Its own
+//! connections to the servers use sockets marked so the redirect skips
+//! them. The CA key lives only in memory, so the certificate is worthless
+//! once the proxy stops. The proxy checks each server's real certificate
 //! against the Mozilla roots, so it never hides a forged server.
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,12 +27,16 @@ use rcgen::{
     KeyPair, KeyUsagePurpose,
 };
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::server::Acceptor;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
 use rustls::{StreamOwned, crypto::ring};
 use serde::Serialize;
+use socket2::{SockAddr, SockRef, Socket};
 
-/// Where clients send their requests.
-pub const ADDR: &str = "127.0.0.1:8899";
+pub use crate::helper_proto::PROXY_PORT as PORT;
+
+/// TLS record type of a handshake: the first byte a TLS client sends.
+const TLS_HANDSHAKE: u8 = 0x16;
 /// Body bytes kept for display, before and after decompression.
 const BODY_MAX: usize = 64 * 1024;
 /// Longest request or response head.
@@ -83,9 +92,15 @@ pub struct Body {
 /// Running proxy. Dropping it stops new connections and deletes the CA file.
 pub struct Mitm {
     stop: Arc<AtomicBool>,
-    /// PEM file of the CA certificate, for clients to trust.
+    /// PEM file of the CA certificate, for the user to inspect or import.
     pub ca_path: PathBuf,
+    /// The same certificate, for the helper to trust.
+    pub ca_pem: String,
 }
+
+/// Makes the TCP socket for a connection to a server: IPv6 when `true`.
+/// It must be marked so the redirect lets it through.
+pub type Connector = dyn Fn(bool) -> io::Result<OwnedFd> + Send + Sync;
 
 /// What every connection shares.
 struct Shared {
@@ -93,17 +108,26 @@ struct Shared {
     /// Server configuration per host name, with a certificate for that name.
     hosts: Mutex<HashMap<String, Arc<ServerConfig>>>,
     upstream: Arc<ClientConfig>,
+    connector: Arc<Connector>,
     stop: Arc<AtomicBool>,
     emit: Box<dyn Fn(Exchange) + Send + Sync>,
     ids: AtomicU64,
 }
 
 impl Mitm {
-    /// Listens on `ADDR` and writes the CA certificate next to the
-    /// recordings. `emit` runs on a connection thread for each exchange.
-    pub fn start(emit: impl Fn(Exchange) + Send + Sync + 'static) -> io::Result<Self> {
-        let listener = TcpListener::bind(ADDR)?;
-        listener.set_nonblocking(true)?;
+    /// Listens on `PORT` of 127.0.0.1 and ::1, where the redirect delivers,
+    /// and writes the CA certificate next to the recordings. `emit` runs on
+    /// a connection thread for each exchange.
+    pub fn start(
+        connector: Arc<Connector>,
+        emit: impl Fn(Exchange) + Send + Sync + 'static,
+    ) -> io::Result<Self> {
+        let mut listeners = vec![TcpListener::bind((Ipv4Addr::LOCALHOST, PORT))?];
+        // A machine without IPv6 has no ::1, and no IPv6 traffic to redirect.
+        listeners.extend(TcpListener::bind((Ipv6Addr::LOCALHOST, PORT)).ok());
+        for l in &listeners {
+            l.set_nonblocking(true)?;
+        }
         let ca = new_ca().map_err(io::Error::other)?;
         let ca_path = crate::export::cache_dir()?.join("mitm-ca.pem");
         let mut file = OpenOptions::new()
@@ -124,16 +148,22 @@ impl Mitm {
         // HTTP/2 frames are not parsed: both sides speak HTTP/1.1.
         upstream.alpn_protocols = vec![b"http/1.1".to_vec()];
         let stop = Arc::new(AtomicBool::new(false));
+        let ca_pem = ca.pem();
         let shared = Arc::new(Shared {
             ca,
             hosts: Mutex::default(),
             upstream: Arc::new(upstream),
+            connector,
             stop: Arc::clone(&stop),
             emit: Box::new(emit),
             ids: AtomicU64::new(0),
         });
-        std::thread::spawn(move || accept_loop(&listener, &shared));
-        Ok(Self { stop, ca_path })
+        std::thread::spawn(move || accept_loop(&listeners, &shared));
+        Ok(Self {
+            stop,
+            ca_path,
+            ca_pem,
+        })
     }
 }
 
@@ -144,23 +174,28 @@ impl Drop for Mitm {
     }
 }
 
-fn accept_loop(listener: &TcpListener, shared: &Arc<Shared>) {
+fn accept_loop(listeners: &[TcpListener], shared: &Arc<Shared>) {
     let mut conn = 0;
     while !shared.stop.load(Ordering::Relaxed) {
-        match listener.accept() {
-            Ok((stream, peer)) => {
-                conn += 1;
-                let shared = Arc::clone(shared);
-                std::thread::spawn(move || {
-                    if let Err(e) = serve(stream, peer, conn, &shared) {
-                        eprintln!("mitm connection {conn}: {e}");
-                    }
-                });
+        let mut idle = true;
+        for listener in listeners {
+            match listener.accept() {
+                Ok((stream, peer)) => {
+                    idle = false;
+                    conn += 1;
+                    let shared = Arc::clone(shared);
+                    std::thread::spawn(move || {
+                        if let Err(e) = serve(stream, peer, conn, &shared) {
+                            eprintln!("mitm connection {conn}: {e}");
+                        }
+                    });
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => eprintln!("mitm accept: {e}"),
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => eprintln!("mitm accept: {e}"),
+        }
+        if idle {
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }
@@ -195,53 +230,87 @@ struct Target {
     authority: String,
 }
 
-fn serve(stream: TcpStream, peer: SocketAddr, conn: u64, shared: &Shared) -> io::Result<()> {
+fn serve(mut stream: TcpStream, peer: SocketAddr, conn: u64, shared: &Shared) -> io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(IDLE))?;
-    let mut client = BufReader::new(stream);
-    let Some(head) = read_head(&mut client)? else {
-        return Ok(());
-    };
-    let req = parse_request(&head)?;
+    let dst = original_dst(&stream)?;
     let base = Exchange {
         conn,
         client: peer.to_string(),
         ..Exchange::default()
     };
-    if req.method.eq_ignore_ascii_case("CONNECT") {
-        let authority = req.target.clone();
-        let host = host_of(&authority).to_owned();
-        client
-            .get_mut()
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
-        // shortcut: bytes the client sent before our 200 are dropped; clients wait for it.
-        let tcp = client.into_inner();
+    let mut first = [0u8; 1];
+    if stream.peek(&mut first)? == 0 {
+        return Ok(());
+    }
+    if first[0] == TLS_HANDSHAKE {
+        // Read the ClientHello first: its server name picks the certificate.
+        let mut acceptor = Acceptor::default();
+        let accepted = loop {
+            if acceptor.read_tls(&mut stream)? == 0 {
+                return Ok(());
+            }
+            match acceptor.accept() {
+                Ok(Some(a)) => break a,
+                Ok(None) => {}
+                Err((e, mut alert)) => {
+                    let _ = alert.write_all(&mut stream);
+                    return Err(io::Error::other(e));
+                }
+            }
+        };
+        let host = accepted
+            .client_hello()
+            .server_name()
+            .map_or_else(|| dst.ip().to_string(), str::to_owned);
         let config = shared.host_config(&host)?;
-        let tls = StreamOwned::new(
-            ServerConnection::new(config).map_err(io::Error::other)?,
-            tcp,
-        );
-        let server = connect_tls(&authority, &host, &shared.upstream);
+        let tls = match accepted.into_connection(config) {
+            Ok(c) => StreamOwned::new(c, stream),
+            Err((e, mut alert)) => {
+                let _ = alert.write_all(&mut stream);
+                return Err(io::Error::other(e));
+            }
+        };
+        let server = connect_tls(dst, &host, shared);
         let target = Target {
             scheme: "https",
-            authority,
+            authority: authority(&host, dst.port(), 443),
         };
         exchanges(BufReader::new(tls), server, None, &target, base, shared)
     } else {
-        // An absolute-form request: plain HTTP through the proxy.
-        let Some(rest) = req.target.strip_prefix("http://") else {
-            let reply =
-                "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            return client.get_mut().write_all(reply.as_bytes());
+        let mut client = BufReader::new(stream);
+        let Some(head) = read_head(&mut client)? else {
+            return Ok(());
         };
-        let authority = rest.split('/').next().unwrap_or_default().to_owned();
-        let server = connect(&with_port(&authority, 80)).map(BufReader::new);
+        let req = parse_request(&head)?;
         let target = Target {
             scheme: "http",
-            authority,
+            authority: header(&req.headers, "host").map_or_else(
+                || authority(&dst.ip().to_string(), dst.port(), 80),
+                str::to_owned,
+            ),
         };
+        let server = connect(dst, shared).map(BufReader::new);
         exchanges(client, server, Some(head), &target, base, shared)
     }
+}
+
+/// Where a redirected connection was going.
+fn original_dst(stream: &TcpStream) -> io::Result<SocketAddr> {
+    let sock = SockRef::from(stream);
+    let local = stream.local_addr()?;
+    let dst = if local.is_ipv6() {
+        sock.original_dst_v6()
+    } else {
+        sock.original_dst_v4()
+    }?
+    .as_socket()
+    .ok_or_else(|| io::Error::other("no original destination"))?;
+    // A direct connection to the proxy would make it connect to itself.
+    if dst == local {
+        return Err(io::Error::other("the connection was not redirected"));
+    }
+    Ok(dst)
 }
 
 impl Shared {
@@ -301,25 +370,27 @@ fn set_validity(params: &mut CertificateParams) {
     params.not_after = at(now + VALID_DAYS * day);
 }
 
-fn connect(authority: &str) -> io::Result<TcpStream> {
-    let addr = authority
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::other(format!("{authority} has no address")))?;
-    let s = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+/// Connects to the server the client was going to, on a socket the
+/// redirect lets through.
+fn connect(dst: SocketAddr, shared: &Shared) -> io::Result<TcpStream> {
+    let sock = Socket::from((shared.connector)(dst.is_ipv6())?);
+    sock.connect_timeout(&SockAddr::from(dst), CONNECT_TIMEOUT)?;
+    let s = TcpStream::from(sock);
     s.set_read_timeout(Some(IDLE))?;
     Ok(s)
 }
 
-/// TLS connection to the real server, with its certificate checked.
+/// TLS connection to the real server, with its certificate checked for
+/// the name the client asked for.
 fn connect_tls(
-    authority: &str,
+    dst: SocketAddr,
     host: &str,
-    config: &Arc<ClientConfig>,
+    shared: &Shared,
 ) -> io::Result<BufReader<StreamOwned<ClientConnection, TcpStream>>> {
-    let tcp = connect(&with_port(authority, 443))?;
+    let tcp = connect(dst, shared)?;
     let name = ServerName::try_from(host.to_owned()).map_err(io::Error::other)?;
-    let conn = ClientConnection::new(Arc::clone(config), name).map_err(io::Error::other)?;
+    let conn =
+        ClientConnection::new(Arc::clone(&shared.upstream), name).map_err(io::Error::other)?;
     let mut tls = StreamOwned::new(conn, tcp);
     // Handshake now, so a bad server certificate shows as this exchange's error.
     while tls.conn.is_handshaking() {
@@ -356,12 +427,8 @@ fn exchanges<C: Sock, S: Sock>(
             ex.id = shared.ids.fetch_add(1, Ordering::Relaxed) + 1;
             ex.at_ms = now_ms();
             let text = ex.error.clone().unwrap_or_default();
-            let reply = format!(
-                "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
-                text.len()
-            );
             (shared.emit)(ex);
-            return client.get_mut().write_all(reply.as_bytes());
+            return client.get_mut().write_all(bad_gateway(&text).as_bytes());
         }
     };
     let local = server
@@ -389,7 +456,7 @@ fn exchanges<C: Sock, S: Sock>(
                 (shared.emit)(Exchange {
                     id: shared.ids.fetch_add(1, Ordering::Relaxed) + 1,
                     at_ms: now_ms(),
-                    method: "CONNECT".to_owned(),
+                    method: "TLS".to_owned(),
                     url: url(target, "/"),
                     error: Some(format!(
                         "the client did not accept the interception certificate: {e}"
@@ -415,15 +482,6 @@ fn exchanges<C: Sock, S: Sock>(
             remote: remote.clone(),
             ..base.clone()
         };
-        // Origin form towards the server: `GET /path`, not `GET http://host/path`.
-        let head = if req.target.starts_with("http://") {
-            let path = req.target["http://".len()..]
-                .find('/')
-                .map_or("/", |i| &req.target["http://".len() + i..]);
-            rewrite_target(&head, &req.target, path)
-        } else {
-            head
-        };
         server.get_mut().write_all(&head)?;
         let req_framing = framing(&req.headers, true);
         ex.req_body = copy_body(&mut client, server.get_mut(), req_framing, &req.headers)?;
@@ -431,9 +489,16 @@ fn exchanges<C: Sock, S: Sock>(
 
         // Interim 1xx responses go to the client as they come.
         let resp = loop {
-            let Some(head) = read_head(&mut server)? else {
-                ex.error = Some("the server closed the connection".to_owned());
-                break None;
+            let head = match read_head(&mut server) {
+                Ok(Some(h)) => h,
+                Ok(None) => {
+                    ex.error = Some("the server closed the connection".to_owned());
+                    break None;
+                }
+                Err(e) => {
+                    ex.error = Some(format!("no response from the server: {e}"));
+                    break None;
+                }
             };
             client.get_mut().write_all(&head)?;
             let resp = parse_response(&head)?;
@@ -443,7 +508,10 @@ fn exchanges<C: Sock, S: Sock>(
         };
         let Some(resp) = resp else {
             ex.ms = elapsed_ms(started);
+            let text = ex.error.clone().unwrap_or_default();
             (shared.emit)(ex);
+            // The client got no answer: tell it why rather than close silently.
+            let _ = client.get_mut().write_all(bad_gateway(&text).as_bytes());
             break;
         };
         ex.status = Some(resp.status);
@@ -472,6 +540,14 @@ fn exchanges<C: Sock, S: Sock>(
         }
     }
     Ok(())
+}
+
+/// A 502 response that closes the connection, with `text` as its body.
+fn bad_gateway(text: &str) -> String {
+    format!(
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+        text.len()
+    )
 }
 
 /// Copies bytes both ways until either side closes.
@@ -759,15 +835,6 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
-/// Replaces the request target in the first line of `head`.
-fn rewrite_target(head: &[u8], from: &str, to: &str) -> Vec<u8> {
-    let end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
-    let line = String::from_utf8_lossy(&head[..end]).replacen(from, to, 1);
-    let mut out = line.into_bytes();
-    out.extend_from_slice(&head[end..]);
-    out
-}
-
 fn url(target: &Target, path: &str) -> String {
     if path.starts_with('/') {
         let default = if target.scheme == "https" {
@@ -785,23 +852,17 @@ fn url(target: &Target, path: &str) -> String {
     }
 }
 
-/// Host part of `host:port` or `[v6]:port`.
-fn host_of(authority: &str) -> &str {
-    if let Some(rest) = authority.strip_prefix('[') {
-        return rest.split(']').next().unwrap_or(rest);
-    }
-    authority.rsplit_once(':').map_or(authority, |(h, _)| h)
-}
-
-fn with_port(authority: &str, port: u16) -> String {
-    let has_port = match authority.rsplit_once(':') {
-        Some((h, p)) => (!h.contains(':') || h.ends_with(']')) && p.parse::<u16>().is_ok(),
-        None => false,
+/// `host` or `host:port` as a URL names it: IPv6 in brackets, the port
+/// only when it is not the scheme's default.
+fn authority(host: &str, port: u16, default: u16) -> String {
+    let host = match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => format!("[{host}]"),
+        _ => host.to_owned(),
     };
-    if has_port {
-        authority.to_owned()
+    if port == default {
+        host
     } else {
-        format!("{authority}:{port}")
+        format!("{host}:{port}")
     }
 }
 
@@ -859,27 +920,51 @@ mod tests {
         assert_eq!((out, b.data.as_slice()), (gz, &b"hello"[..]));
     }
 
-    /// Sends curl through the proxy to `MITM_URL` (default
-    /// `https://example.com/`) and prints what the proxy recorded.
+    /// Runs `nft` with `script` on stdin.
+    fn nft(script: &str) {
+        let mut child = std::process::Command::new("nft")
+            .args(["-f", "-"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success(), "nft failed");
+    }
+
+    /// Installs the helper's redirect rules, runs a plain curl (no proxy
+    /// option) to `MITM_URL` (default `https://example.com/`) and prints
+    /// what the proxy recorded. Needs root in a network namespace, e.g.
+    /// `pasta --config-net -- cargo test ... live_proxy -- --ignored`.
     #[test]
-    #[ignore = "network"]
+    #[ignore = "network and a root network namespace"]
     fn live_proxy() {
         let url = std::env::var("MITM_URL").unwrap_or_else(|_| "https://example.com/".into());
         let (tx, rx) = std::sync::mpsc::channel();
         let tx = Mutex::new(tx);
-        let mitm = Mitm::start(move |ex| drop(tx.lock().unwrap().send(ex))).unwrap();
+        let connector: Arc<Connector> = Arc::new(|v6| {
+            let domain = if v6 {
+                socket2::Domain::IPV6
+            } else {
+                socket2::Domain::IPV4
+            };
+            let s = Socket::new(domain, socket2::Type::STREAM, None)?;
+            s.set_mark(crate::helper_proto::MARK)?;
+            Ok(s.into())
+        });
+        let mitm = Mitm::start(connector, move |ex| drop(tx.lock().unwrap().send(ex))).unwrap();
+        nft(&crate::helper_proto::rules());
         let out = std::process::Command::new("curl")
-            .args([
-                "-sS",
-                "--compressed",
-                "--proxy",
-                &format!("http://{ADDR}"),
-                "--cacert",
-            ])
+            .args(["-sS", "--compressed", "--cacert"])
             .arg(&mitm.ca_path)
             .arg(&url)
             .output()
             .unwrap();
+        nft(&crate::helper_proto::remove_rules());
         assert!(
             out.status.success(),
             "curl: {}",
@@ -913,22 +998,16 @@ mod tests {
 
     #[test]
     fn heads_targets_and_framing() {
-        let mut r =
-            BufReader::new(&b"\r\nGET http://a.test/x?y HTTP/1.1\r\nHost: a.test\r\n\r\nrest"[..]);
+        let mut r = BufReader::new(&b"\r\nGET /x?y HTTP/1.1\r\nHost: a.test\r\n\r\nrest"[..]);
         let head = read_head(&mut r).unwrap().unwrap();
+        assert_eq!(head, b"GET /x?y HTTP/1.1\r\nHost: a.test\r\n\r\n");
         let req = parse_request(&head).unwrap();
-        assert_eq!(
-            (req.method.as_str(), req.target.as_str()),
-            ("GET", "http://a.test/x?y")
-        );
-        let line = rewrite_target(&head, &req.target, "/x?y");
-        assert!(line.starts_with(b"GET /x?y HTTP/1.1\r\nHost: a.test\r\n\r\n"));
+        assert_eq!((req.method.as_str(), req.target.as_str()), ("GET", "/x?y"));
+        assert_eq!(header(&req.headers, "HOST"), Some("a.test"));
         assert_eq!(framing(&req.headers, true), Framing::Length(0));
         assert_eq!(framing(&[], false), Framing::UntilClose);
-        assert_eq!(host_of("[::1]:443"), "::1");
-        assert_eq!(host_of("example.com:443"), "example.com");
-        assert_eq!(with_port("example.com", 80), "example.com:80");
-        assert_eq!(with_port("[::1]:8080", 80), "[::1]:8080");
+        assert_eq!(authority("example.com", 443, 443), "example.com");
+        assert_eq!(authority("2001:db8::1", 8443, 443), "[2001:db8::1]:8443");
         assert!(read_head(&mut BufReader::new(&b""[..])).unwrap().is_none());
     }
 }

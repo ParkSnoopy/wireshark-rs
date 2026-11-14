@@ -1,10 +1,15 @@
 //! Unprivileged desktop shell: hosts the Leptos UI in a WebKitGTK webview.
 //!
-//! At launch it asks pkexec once for a packet socket (see `capture`). Start
-//! and Stop then only bind and unbind that socket: no prompt, no root.
+//! At launch it asks pkexec once for a packet socket (see `helper`). Start
+//! and Stop then only bind and unbind that socket: no prompt, no root. The
+//! same helper sets up HTTPS interception when the user turns it on.
 
 mod capture;
 mod export;
+mod helper;
+// Shared with the helper binary, which uses the parts this one does not.
+#[allow(dead_code)]
+mod helper_proto;
 mod l7;
 mod mitm;
 mod names;
@@ -32,6 +37,7 @@ use wry::{WebView, WebViewBuilder, WebViewBuilderExtUnix};
 
 use capture::Capture;
 use export::Recording;
+use helper::Helper;
 use mitm::{Exchange, Mitm};
 use names::Names;
 use ptr::{Ptr, PtrInfo};
@@ -48,7 +54,7 @@ enum UserEvent {
     /// IPC message from the UI.
     Ipc(String),
     /// Result of the launch-time authorization.
-    Socket(io::Result<OwnedFd>),
+    Socket(io::Result<(OwnedFd, Helper)>),
     /// Registration and transfer dates of a domain seen in traffic.
     Domain(DomainInfo),
     /// Reverse DNS name of an address the UI asked about.
@@ -65,7 +71,8 @@ enum UserEvent {
 #[derive(Serialize)]
 struct MitmState {
     on: bool,
-    addr: &'static str,
+    /// Port the redirected traffic reaches the proxy on.
+    port: u16,
     ca: Option<String>,
     error: Option<String>,
 }
@@ -89,6 +96,8 @@ struct App {
     webview: WebView,
     proxy: EventLoopProxy<UserEvent>,
     socket: Option<Arc<OwnedFd>>,
+    /// The root helper, kept for HTTPS interception.
+    helper: Option<Arc<Helper>>,
     capture: Option<Capture>,
     /// Packets of the latest capture, kept after Stop for "Save pcap".
     recording: Option<Arc<Recording>>,
@@ -114,7 +123,7 @@ fn main() -> wry::Result<()> {
     let proxy = event_loop.create_proxy();
     std::thread::spawn(move || {
         // Fails only when the event loop is gone, i.e. during exit.
-        let _ = proxy.send_event(UserEvent::Socket(capture::request_socket()));
+        let _ = proxy.send_event(UserEvent::Socket(helper::launch()));
     });
 
     let ifaces = serde_json::to_string(&interfaces()?).expect("string list serializes");
@@ -146,6 +155,7 @@ fn main() -> wry::Result<()> {
         webview,
         proxy: event_loop.create_proxy(),
         socket: None,
+        helper: None,
         capture: None,
         recording: None,
         names: Names::default(),
@@ -172,8 +182,9 @@ fn main() -> wry::Result<()> {
                 emit(&app.webview, "notice", &n);
             }
             Event::UserEvent(UserEvent::Socket(result)) => match result {
-                Ok(fd) => {
+                Ok((fd, helper)) => {
                     app.socket = Some(Arc::new(fd));
+                    app.helper = Some(Arc::new(helper));
                     app.set_status("idle", "ready".to_owned());
                 }
                 Err(e) => app.set_status("error", format!("no capture permission: {e}")),
@@ -184,9 +195,10 @@ fn main() -> wry::Result<()> {
             } => {
                 app.capture = None;
                 // tao may exit without dropping the app: delete the pcap
-                // and CA files now.
+                // and CA files and undo interception now.
                 app.recording = None;
                 app.mitm = None;
+                app.helper = None;
                 *control_flow = ControlFlow::Exit;
                 return;
             }
@@ -302,29 +314,48 @@ impl App {
     }
 
     fn set_mitm(&mut self, on: bool) {
-        // Dropping the proxy stops it and deletes its CA file.
-        self.mitm = None;
         let mut state = MitmState {
             on: false,
-            addr: mitm::ADDR,
+            port: mitm::PORT,
             ca: None,
             error: None,
         };
+        // Undo the redirect before the proxy goes, so no connection is
+        // redirected to a closed port. Dropping the proxy deletes its CA file.
+        if self.mitm.take().is_some()
+            && let Some(Err(e)) = self.helper.as_ref().map(|h| h.intercept_off())
+        {
+            state.error = Some(format!("cannot undo interception: {e}"));
+        }
         if on {
-            let proxy = self.proxy.clone();
-            // Fails only when the event loop is gone, i.e. during exit.
-            match Mitm::start(move |ex| drop(proxy.send_event(UserEvent::Http(Box::new(ex))))) {
+            match self.start_mitm() {
                 Ok(m) => {
                     state.on = true;
                     state.ca = Some(m.ca_path.display().to_string());
                     self.mitm = Some(m);
                 }
-                Err(e) => {
-                    state.error = Some(format!("cannot start the proxy on {}: {e}", mitm::ADDR))
-                }
+                Err(e) => state.error = Some(format!("cannot intercept HTTPS: {e}")),
             }
         }
         emit(&self.webview, "mitm", &state);
+    }
+
+    /// Starts the proxy, then has the helper trust its CA and redirect web
+    /// traffic to it. The proxy stops again when the helper fails.
+    fn start_mitm(&self) -> io::Result<Mitm> {
+        let helper = self
+            .helper
+            .clone()
+            .ok_or_else(|| io::Error::other("no privileged helper: launch was not authorized"))?;
+        let marked = Arc::clone(&helper);
+        let proxy = self.proxy.clone();
+        let m = Mitm::start(
+            Arc::new(move |v6| marked.marked_socket(v6)),
+            // Fails only when the event loop is gone, i.e. during exit.
+            move |ex| drop(proxy.send_event(UserEvent::Http(Box::new(ex)))),
+        )?;
+        helper.intercept_on(&m.ca_pem)?;
+        Ok(m)
     }
 
     fn set_status(&mut self, state: &'static str, text: String) {

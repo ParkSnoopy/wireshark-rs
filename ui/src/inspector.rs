@@ -267,7 +267,7 @@ fn messages(
                     <h4>"As captured"</h4>
                     {encrypted.then(|| view! {
                         <p class="inspector-note">
-                            "This traffic is encrypted. Turn on the HTTPS proxy and send the client through it to read HTTPS content."
+                            "This traffic is encrypted. Turn on the HTTPS proxy to read the content of new connections."
                         </p>
                     })}
                     {d.turns.into_iter().map(|t| turn(t, jump)).collect_view()}
