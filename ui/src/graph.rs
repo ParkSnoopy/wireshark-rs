@@ -2,6 +2,9 @@
 //! (drag nodes or the background, wheel to zoom, click a node to inspect),
 //! its ontology, a node inspector and the build log.
 //!
+//! Each host is one card that lists what is known about it: names,
+//! address block, interface, traffic, the services it offers and the
+//! programs on it. Edges join hosts and name the services they carry.
 //! Hosts in the same special-purpose address block (10.0.0.0/8, fe80::/10,
 //! ...) are pulled together and framed with the block's CIDR.
 
@@ -12,7 +15,7 @@ use leptos::prelude::*;
 use leptos::svg::Svg;
 use wasm_bindgen::JsCast;
 
-use crate::model::{Domains, Graph, Kind, Node, Ptrs, Rel, Scope, bytes, ptr_of};
+use crate::model::{Domains, Graph, Node, Part, Ptrs, Rel, Scope, bytes, ptr_of};
 use crate::tip::{Card, Tip, facts};
 
 /// Build log entries rendered, newest first.
@@ -26,19 +29,36 @@ const ALPHA_MIN: f64 = 0.004;
 const ALPHA_DECAY: f64 = 0.0228;
 /// Share of velocity kept per tick.
 const FRICTION: f64 = 0.6;
-const REPULSION: f64 = 700.0;
+const REPULSION: f64 = 2500.0;
 /// Bodies farther apart than this do not repel each other.
-const REPULSION_RANGE: f64 = 480.0;
+const REPULSION_RANGE: f64 = 800.0;
 const SPRING: f64 = 0.3;
 const GRAVITY: f64 = 0.02;
 /// Pull of hosts toward the middle of their address block.
 const CLUSTER: f64 = 0.05;
+/// Share of an overlap between two cards removed per tick.
+const COLLIDE: f64 = 0.5;
+/// Least space between two cards.
+const CARD_GAP: f64 = 24.0;
 /// Pointer travel in px that turns a click into a drag.
 const DRAG_SLOP: f64 = 3.0;
-/// Space between an address block frame and its nodes.
-const HULL_PAD: f64 = 36.0;
+/// Space between an address block frame and its cards.
+const HULL_PAD: f64 = 16.0;
 /// Height of the CIDR label band at the top of a frame.
 const HULL_LABEL: f64 = 24.0;
+/// Card width, and the characters a line holds at 11px IBM Plex Mono
+/// (6.6px each) inside the padding.
+const CARD_W: f64 = 220.0;
+const CARD_CHARS: usize = 30;
+const CARD_PAD: f64 = 10.0;
+/// Baseline of the title from the card top, and the step between lines.
+const CARD_TITLE: f64 = 22.0;
+const CARD_LINE: f64 = 15.0;
+/// Services and processes listed on a card before "+N more".
+const SERVICE_ROWS: usize = 6;
+const PROCESS_ROWS: usize = 4;
+/// Services named on an edge before "+N".
+const EDGE_PROTOS: usize = 2;
 
 #[derive(Clone, Copy, Default)]
 struct Body {
@@ -158,6 +178,34 @@ fn step(s: &mut Sim, g: &Graph) -> bool {
         b[e.from].vx += dx * f;
         b[e.from].vy += dy * f;
     }
+    // Cards are wide: push overlapping ones apart along the shorter way out.
+    let sizes: Vec<(f64, f64)> = g.nodes.iter().map(card_size).collect();
+    let fixed = |i: usize, b: &[Body]| b[i].pinned || held == Some(i);
+    for i in 0..b.len().min(sizes.len()) {
+        for j in i + 1..b.len().min(sizes.len()) {
+            let (dx, dy) = (b[j].x - b[i].x, b[j].y - b[i].y);
+            let ox = (sizes[i].0 + sizes[j].0) / 2.0 + CARD_GAP - dx.abs();
+            let oy = (sizes[i].1 + sizes[j].1) / 2.0 + CARD_GAP - dy.abs();
+            if ox <= 0.0 || oy <= 0.0 {
+                continue;
+            }
+            let (px, py) = if ox < oy {
+                (ox.copysign(dx) * COLLIDE, 0.0)
+            } else {
+                (0.0, oy.copysign(dy) * COLLIDE)
+            };
+            let (fi, fj) = match (fixed(i, b), fixed(j, b)) {
+                (true, true) => continue,
+                (true, false) => (0.0, 1.0),
+                (false, true) => (1.0, 0.0),
+                (false, false) => (0.5, 0.5),
+            };
+            b[i].x -= px * fi;
+            b[i].y -= py * fi;
+            b[j].x += px * fj;
+            b[j].y += py * fj;
+        }
+    }
     let mut blocks: BTreeMap<&str, (f64, f64, f64)> = BTreeMap::new();
     for (n, body) in g.nodes.iter().zip(b.iter()) {
         if let Some(s) = block(n) {
@@ -187,19 +235,15 @@ fn step(s: &mut Sim, g: &Graph) -> bool {
     s.alpha >= ALPHA_MIN || s.target > 0.0
 }
 
-/// Gives new nodes a start position: services and processes next to their
-/// host, hosts on a golden-angle spiral so none lands on another.
+/// Gives new hosts a start position on a golden-angle spiral, so none
+/// lands on another.
 fn place_new(s: &mut Sim, g: &Graph) {
-    for (i, node) in g.nodes.iter().enumerate().skip(s.bodies.len()) {
-        let anchor = match node.kind {
-            Kind::Host => None,
-            Kind::Service { host } | Kind::Process { host } => s.bodies.get(host).copied(),
-        };
+    for i in s.bodies.len()..g.nodes.len() {
         let angle = i as f64 * 2.399_963;
-        let (cx, cy, r) = anchor.map_or((0.0, 0.0, 30.0 * (i as f64).sqrt()), |h| (h.x, h.y, 60.0));
+        let r = 160.0 * (i as f64).sqrt();
         s.bodies.push(Body {
-            x: cx + r * angle.cos(),
-            y: cy + r * angle.sin(),
+            x: r * angle.cos(),
+            y: r * angle.sin(),
             ..Body::default()
         });
     }
@@ -207,43 +251,135 @@ fn place_new(s: &mut Sim, g: &Graph) {
 
 fn rest_length(rel: Rel) -> f64 {
     match rel {
-        Rel::RunsOn => 50.0,
-        Rel::Serves => 60.0,
-        Rel::Exchanges => 140.0,
-        Rel::Connects => 170.0,
+        Rel::Exchanges => 300.0,
+        Rel::Connects => 340.0,
     }
 }
 
 /// Address block a host is framed in. Multicast and broadcast are not networks a host is in.
 fn block(n: &Node) -> Option<Scope> {
     n.scope
-        .filter(|s| n.kind == Kind::Host && !matches!(s.kind, "multicast" | "broadcast"))
+        .filter(|s| !matches!(s.kind, "multicast" | "broadcast"))
+}
+
+/// Lines a card shows under its title: three fixed ones, then services
+/// and processes, each list cut to its row limit plus a "+N more" line.
+fn card_rows(n: &Node) -> usize {
+    let shown = |len: usize, max: usize| if len > max { max + 1 } else { len };
+    3 + shown(n.services.len(), SERVICE_ROWS) + shown(n.processes.len(), PROCESS_ROWS)
+}
+
+fn card_height(rows: usize) -> f64 {
+    CARD_TITLE + 6.0 + CARD_LINE * rows as f64 + CARD_PAD
+}
+
+/// Width and height of the card of `n`, in world units.
+fn card_size(n: &Node) -> (f64, f64) {
+    (CARD_W, card_height(card_rows(n)))
+}
+
+/// `s` cut to `max` characters, with an ellipsis when cut.
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    let mut out: String = s.chars().take(max - 1).collect();
+    out.push('…');
+    out
+}
+
+/// One card line: class, text, and a count shown at the right edge.
+type CardLine = (&'static str, String, String);
+
+/// Title and lines of the card of `n`. Every line is present whatever is
+/// known, so the size matches `card_rows`.
+fn card_content(n: &Node, ptr: Option<&str>) -> (String, Vec<CardLine>) {
+    let title = n.name.clone().unwrap_or_else(|| n.label.clone());
+    let names: Vec<&str> = n
+        .name
+        .as_ref()
+        .map(|_| n.label.as_str())
+        .into_iter()
+        .chain(ptr)
+        .collect();
+    let names = if names.is_empty() {
+        "no reverse name".to_owned()
+    } else {
+        names.join(" · ")
+    };
+    let block = n
+        .scope
+        .map_or("public".to_owned(), |s| format!("{} {}", s.kind, s.cidr));
+    let place = match &n.iface {
+        Some(f) => format!("{block} · {}", iface_text(f.local, &f.name)),
+        None => block,
+    };
+    let mut lines: Vec<CardLine> = vec![
+        ("card-sub", clip(&names, CARD_CHARS), String::new()),
+        ("card-sub", clip(&place, CARD_CHARS), String::new()),
+        (
+            "card-sub",
+            format!("{} packets · {}", n.packets, bytes(n.bytes)),
+            String::new(),
+        ),
+    ];
+    let mut list = |parts: &[Part], mark: &str, class: &'static str, max: usize, what: &str| {
+        for p in parts.iter().take(max) {
+            let count = p.packets.to_string();
+            // Room for the mark, a space, a gap and the count.
+            let label = clip(&p.label, CARD_CHARS.saturating_sub(count.len() + 3));
+            lines.push((class, format!("{mark} {label}"), count));
+        }
+        if parts.len() > max {
+            let more = format!("+{} more {what}", parts.len() - max);
+            lines.push(("card-more", more, String::new()));
+        }
+    };
+    list(&n.services, "▸", "card-service", SERVICE_ROWS, "services");
+    list(&n.processes, "◆", "card-process", PROCESS_ROWS, "processes");
+    (clip(&title, CARD_CHARS - 2), lines)
+}
+
+/// Services on an edge: the first `EDGE_PROTOS`, then "+N".
+fn edge_label(protos: &[String]) -> String {
+    let mut text = protos
+        .iter()
+        .take(EDGE_PROTOS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if protos.len() > EDGE_PROTOS {
+        text.push_str(&format!(" +{}", protos.len() - EDGE_PROTOS));
+    }
+    text
+}
+
+/// Corners of the area the cards cover: `(x0, y0, x1, y1)`.
+fn extent(n: &Node, b: &Body) -> (f64, f64, f64, f64) {
+    let (w, h) = card_size(n);
+    (b.x - w / 2.0, b.y - h / 2.0, b.x + w / 2.0, b.y + h / 2.0)
 }
 
 /// Frames around each address block: `(label, x, y, width, height)` in world units.
 fn hulls(g: &Graph, bodies: &[Body]) -> Vec<(String, f64, f64, f64, f64)> {
     let mut boxes: BTreeMap<&str, (&str, f64, f64, f64, f64)> = BTreeMap::new();
     for (n, b) in g.nodes.iter().zip(bodies) {
-        // A service or process sits inside the frame of its host.
-        let owner = match n.kind {
-            Kind::Host => n,
-            Kind::Service { host } | Kind::Process { host } => &g.nodes[host],
-        };
-        let Some(s) = block(owner) else { continue };
-        let e = boxes.entry(s.cidr).or_insert((s.kind, b.x, b.y, b.x, b.y));
-        *e = (e.0, e.1.min(b.x), e.2.min(b.y), e.3.max(b.x), e.4.max(b.y));
+        let Some(s) = block(n) else { continue };
+        let (x0, y0, x1, y1) = extent(n, b);
+        let e = boxes.entry(s.cidr).or_insert((s.kind, x0, y0, x1, y1));
+        *e = (e.0, e.1.min(x0), e.2.min(y0), e.3.max(x1), e.4.max(y1));
     }
     boxes
         .into_iter()
         .map(|(cidr, (kind, x0, y0, x1, y1))| {
-            // A label band on top, and room below for the host label and note.
+            // A label band on top.
             let (x, y) = (x0 - HULL_PAD, y0 - HULL_PAD - HULL_LABEL);
             (
                 format!("{cidr} · {kind}"),
                 x,
                 y,
                 x1 - x0 + 2.0 * HULL_PAD,
-                y1 - y0 + 2.0 * HULL_PAD + 2.0 * HULL_LABEL,
+                y1 - y0 + 2.0 * HULL_PAD + HULL_LABEL,
             )
         })
         .collect()
@@ -302,20 +438,20 @@ pub fn GraphPage(
     };
     let fit = move || {
         let Some((w, h)) = size() else { return };
-        let bounds = sim.with_value(|s| {
-            s.bodies
-                .iter()
-                .fold(None, |acc: Option<(f64, f64, f64, f64)>, b| {
-                    Some(acc.map_or((b.x, b.y, b.x, b.y), |(x0, y0, x1, y1)| {
-                        (x0.min(b.x), y0.min(b.y), x1.max(b.x), y1.max(b.y))
-                    }))
-                })
+        let bounds = graph.with_untracked(|g| {
+            sim.with_value(|s| {
+                g.nodes
+                    .iter()
+                    .zip(&s.bodies)
+                    .map(|(n, b)| extent(n, b))
+                    .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)))
+            })
         });
         let Some((x0, y0, x1, y1)) = bounds else {
             return;
         };
-        // Room for address block frames and labels around the outer nodes.
-        let pad = 2.0 * (HULL_PAD + 48.0);
+        // Room for address block frames and their labels around the outer cards.
+        let pad = 2.0 * (HULL_PAD + HULL_LABEL + 8.0);
         let k = ((w - pad) / (x1 - x0).max(1.0))
             .min((h - pad) / (y1 - y0).max(1.0))
             .clamp(ZOOM_MIN, 1.5);
@@ -579,17 +715,32 @@ pub fn GraphPage(
                                                     )
                                             })
                                     };
+                                    let dim_edge = move || selected.get().is_some_and(|s| s != from && s != to);
+                                    let mid = move || {
+                                        let (a, b) = (pos(from), pos(to));
+                                        ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0)
+                                    };
+                                    let label = move || graph.with(|g| g.edges.get(i).map(|e| edge_label(&e.protos)));
                                     view! {
                                         <line
                                             class="edge"
                                             data-rel=rel_attr(rel)
-                                            class:dim=move || selected.get().is_some_and(|s| s != from && s != to)
+                                            class:dim=dim_edge
                                             x1=move || pos(from).0
                                             y1=move || pos(from).1
                                             x2=move || pos(to).0
                                             y2=move || pos(to).1
                                             stroke-width=width
                                         />
+                                        <text
+                                            class="edge-label"
+                                            class:dim=dim_edge
+                                            x=move || mid().0
+                                            y=move || mid().1 + 4.0
+                                            text-anchor="middle"
+                                        >
+                                            {label}
+                                        </text>
                                     }
                                 }
                             />
@@ -601,7 +752,7 @@ pub fn GraphPage(
                                 children=move |i| {
                                     view! {
                                         <g
-                                            class=graph.with_untracked(|g| kind_class(g.nodes[i].kind))
+                                            class="node node-card"
                                             data-node=i
                                             transform=move || {
                                                 let (x, y) = pos(i);
@@ -612,7 +763,7 @@ pub fn GraphPage(
                                             class:pinned=move || pinned(i)
                                             class:flagged=move || flagged(i)
                                         >
-                                            {node_shape(graph, i)}
+                                            {node_card_view(graph, ptrs, i)}
                                         </g>
                                     }
                                 }
@@ -714,77 +865,56 @@ pub fn GraphPage(
     }
 }
 
-fn kind_class(kind: Kind) -> &'static str {
-    match kind {
-        Kind::Host => "node node-host",
-        Kind::Service { .. } => "node node-service",
-        Kind::Process { .. } => "node node-process",
-    }
-}
-
 fn rel_attr(rel: Rel) -> &'static str {
     match rel {
-        Rel::Serves => "serves",
         Rel::Connects => "connects",
         Rel::Exchanges => "direct",
-        Rel::RunsOn => "runs-on",
     }
 }
 
-/// Width of a service box: IBM Plex Mono at 12px advances 7.2px per glyph.
-fn label_width(label: &str) -> f64 {
-    label.chars().count() as f64 * 7.2 + 16.0
-}
-
-fn node_shape(graph: RwSignal<Graph>, i: usize) -> AnyView {
-    let (label, kind) = graph.with_untracked(|g| (g.nodes[i].label.clone(), g.nodes[i].kind));
-    match kind {
-        Kind::Host => {
-            let r =
-                move || graph.with(|g| 7.0 + (g.nodes[i].packets as f64).log2().clamp(0.0, 10.0));
-            // A host reached by name shows the name, and the address in the note.
-            let name = move || graph.with(|g| g.nodes[i].name.clone());
-            let note = move || {
-                graph.with(|g| {
-                    let n = &g.nodes[i];
-                    let parts: Vec<String> = n
-                        .name
-                        .as_ref()
-                        .map(|_| n.label.clone())
-                        .into_iter()
-                        .chain(n.iface.as_ref().map(|f| iface_text(f.local, &f.name)))
-                        .collect();
-                    parts.join(" · ")
+/// The card of host `i`, centred on its position: title, names, address
+/// block and interface, traffic, services and processes.
+fn node_card_view(graph: RwSignal<Graph>, ptrs: RwSignal<Ptrs>, i: usize) -> impl IntoView {
+    let content = move || {
+        graph.with(|g| ptrs.with(|p| card_content(&g.nodes[i], ptr_of(p, &g.nodes[i].label))))
+    };
+    let h = move || graph.with(|g| card_size(&g.nodes[i]).1);
+    let (x0, x1) = (-CARD_W / 2.0, CARD_W / 2.0);
+    view! {
+        <rect
+            class="card-box"
+            x=x0
+            y=move || -h() / 2.0
+            width=CARD_W
+            height=h
+            rx="8"
+        />
+        <rect class="card-band" x=x0 y=move || -h() / 2.0 width="4" height=h rx="2" />
+        {move || {
+            let (title, lines) = content();
+            let top = -h() / 2.0;
+            let lines = lines
+                .into_iter()
+                .enumerate()
+                .map(|(row, (class, text, count))| {
+                    let y = top + CARD_TITLE + 6.0 + CARD_LINE * (row as f64 + 0.75);
+                    view! {
+                        <text class=class x=x0 + CARD_PAD + 2.0 y=y>
+                            {text}
+                        </text>
+                        <text class="card-count" x=x1 - CARD_PAD y=y text-anchor="end">
+                            {count}
+                        </text>
+                    }
                 })
-            };
+                .collect_view();
             view! {
-                <circle r=r />
-                <text class="node-label" y=move || r() + 14.0 text-anchor="middle">
-                    {move || name().unwrap_or_else(|| label.clone())}
+                <text class="card-title" x=x0 + CARD_PAD + 2.0 y=top + CARD_TITLE>
+                    {title}
                 </text>
-                <text class="node-note" y=move || r() + 27.0 text-anchor="middle">
-                    {note}
-                </text>
+                {lines}
             }
-            .into_any()
-        }
-        Kind::Service { .. } => {
-            let w = label_width(&label);
-            view! {
-                <rect x={-w / 2.0} y="-12" width=w height="24" rx="6" />
-                <text class="node-label" y="4" text-anchor="middle">
-                    {label}
-                </text>
-            }
-            .into_any()
-        }
-        Kind::Process { .. } => view! {
-            <rect x="-6" y="-6" width="12" height="12" rx="2" transform="rotate(45)" />
-            <text class="node-label" x="13" y="4">
-                {label}
-            </text>
-        }
-        .into_any(),
+        }}
     }
 }
 
@@ -796,35 +926,38 @@ fn iface_text(local: bool, name: &str) -> String {
     }
 }
 
+/// `parts` as "label (packets)", busiest first, or "none".
+fn parts_text(parts: &[Part]) -> String {
+    let mut list: Vec<&Part> = parts.iter().collect();
+    list.sort_by_key(|p| std::cmp::Reverse(p.packets));
+    if list.is_empty() {
+        return "none".to_owned();
+    }
+    list.iter()
+        .map(|p| format!("{} ({})", p.label, p.packets))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Facts about node `i`, for the inspector and the hover card.
 fn node_facts(g: &Graph, i: usize, ptrs: &Ptrs, domains: &Domains) -> Vec<(&'static str, String)> {
     let n = &g.nodes[i];
-    let mut list = vec![
-        (
-            "Class",
-            match n.kind {
-                Kind::Host => "Host".to_owned(),
-                Kind::Service { host } => format!("Service on {}", g.nodes[host].label),
-                Kind::Process { host } => format!("Process on {}", g.nodes[host].label),
-            },
-        ),
-        (
-            "Traffic",
-            format!("{} packets · {}", n.packets, bytes(n.bytes)),
-        ),
-    ];
+    let mut list = vec![(
+        "Traffic",
+        format!("{} packets · {}", n.packets, bytes(n.bytes)),
+    )];
     if let Some(e) = g.log.iter().find(|e| e.node == i) {
         list.push(("First seen", format!("{} s", e.time)));
     }
-    if matches!(n.kind, Kind::Host) {
-        let block = n
-            .scope
-            .map_or("public".to_owned(), |s| format!("{} · {}", s.cidr, s.kind));
-        list.push(("Address", block));
-        if let Some(p) = ptr_of(ptrs, &n.label) {
-            list.push(("PTR", p.to_owned()));
-        }
+    let block = n
+        .scope
+        .map_or("public".to_owned(), |s| format!("{} · {}", s.cidr, s.kind));
+    list.push(("Address", block));
+    if let Some(p) = ptr_of(ptrs, &n.label) {
+        list.push(("PTR", p.to_owned()));
     }
+    list.push(("Services", parts_text(&n.services)));
+    list.push(("Processes", parts_text(&n.processes)));
     if let Some(f) = &n.iface {
         list.push(("Interface", iface_text(f.local, &f.name)));
     }
@@ -891,12 +1024,11 @@ fn Inspector(
                     } else {
                         return None;
                     };
-                    let text = if e.proto.is_empty() || e.rel != Rel::Exchanges {
-                        text
-                    } else {
-                        format!("{text} {}", e.proto)
-                    };
-                    Some((other, text, e.packets))
+                    Some((
+                        other,
+                        format!("{text} {}", edge_label(&e.protos)),
+                        e.packets,
+                    ))
                 })
                 .collect();
             list.sort_by_key(|r| std::cmp::Reverse(r.2));
@@ -985,23 +1117,22 @@ fn ontology(g: &Graph) -> impl IntoView + use<> {
         }
     };
     let host = view! {
-        <svg width="28" height="20" aria-hidden="true" class="node-host">
-            <circle cx="14" cy="10" r="7" />
+        <svg width="28" height="20" aria-hidden="true" class="node">
+            <rect class="card-box" x="2" y="2" width="24" height="16" rx="3" />
+            <rect class="card-band" x="2" y="2" width="3" height="16" rx="1.5" />
         </svg>
     }
     .into_any();
-    let service = view! {
-        <svg width="28" height="20" aria-hidden="true" class="node-service">
-            <rect x="2" y="4" width="24" height="12" rx="4" />
-        </svg>
-    }
-    .into_any();
-    let process = view! {
-        <svg width="28" height="20" aria-hidden="true" class="node-process">
-            <rect x="9" y="5" width="10" height="10" rx="2" transform="rotate(45 14 10)" />
-        </svg>
-    }
-    .into_any();
+    let mark = |glyph: &'static str, class: &'static str| {
+        view! {
+            <svg width="28" height="20" aria-hidden="true">
+                <text class=class x="14" y="14" text-anchor="middle">
+                    {glyph}
+                </text>
+            </svg>
+        }
+        .into_any()
+    };
     let hull = view! {
         <svg width="28" height="20" aria-hidden="true" class="hull">
             <rect x="2" y="2" width="24" height="16" rx="5" />
@@ -1011,24 +1142,22 @@ fn ontology(g: &Graph) -> impl IntoView + use<> {
     let blocks: HashSet<&str> = g.nodes.iter().filter_map(block).map(|s| s.cidr).collect();
     view! {
         <dl>
-            {row(host, "Host", "IP address seen in traffic", g.hosts())}
+            {row(host, "Host", "Card for an IP address seen in traffic", g.hosts())}
             {row(
-                service,
+                mark("▸", "card-service"),
                 "Service",
-                "Protocol and port a host offers",
-                g.count_kind(|k| matches!(k, Kind::Service { .. })),
+                "Protocol and port a host offers, listed on its card",
+                g.services(),
             )}
             {row(
-                process,
+                mark("◆", "card-process"),
                 "Process",
-                "Local program that owns a socket",
-                g.count_kind(|k| matches!(k, Kind::Process { .. })),
+                "Local program with a socket on the host, listed on its card",
+                g.processes(),
             )}
             {row(hull, "Address block", "Private, loopback or link-local CIDR", blocks.len())}
-            {row(glyph_line("serves"), "serves", "Host or process to its service", g.count(Rel::Serves))}
-            {row(glyph_line("connects"), "connects to", "Client to a service", g.count(Rel::Connects))}
+            {row(glyph_line("connects"), "connects to", "Client host to server host, labelled with the services", g.count(Rel::Connects))}
             {row(glyph_line("direct"), "exchanges", "Traffic without ports (ICMP, ARP)", g.count(Rel::Exchanges))}
-            {row(glyph_line("runs-on"), "runs on", "Process to its host", g.count(Rel::RunsOn))}
         </dl>
     }
 }

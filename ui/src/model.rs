@@ -1025,53 +1025,50 @@ pub fn csv<'a>(rows: impl IntoIterator<Item = &'a Row>) -> String {
     out
 }
 
-/// Class of a graph node.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Kind {
-    /// An IP address seen in traffic.
-    Host,
-    /// A protocol and port that the host at index `host` offers.
-    Service { host: usize },
-    /// A local program (`firefox`) with sockets on the host at index `host`.
-    Process { host: usize },
-}
-
-/// Relation of a graph edge.
+/// Relation of a graph edge between two hosts.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Rel {
-    /// Host or process → the service it offers.
-    Serves,
-    /// Client host or process → service.
+    /// Client host → server host, over one or more services.
     Connects,
     /// Host → host, for traffic without ports (ICMP, ARP).
     Exchanges,
-    /// Process → the host it runs on.
-    RunsOn,
 }
 
 impl Rel {
     pub fn name(self) -> &'static str {
         match self {
-            Rel::Serves => "serves",
             Rel::Connects => "connects to",
             Rel::Exchanges => "exchanges",
-            Rel::RunsOn => "runs on",
         }
     }
 }
 
+/// Something a host card lists: a service it offers (`TCP/443`) or a
+/// local program with sockets on it (`firefox`), with its traffic.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Node {
+pub struct Part {
     pub label: String,
-    pub kind: Kind,
     pub packets: u64,
     pub bytes: u64,
-    /// Hosts only: the related interface, when the shell named one.
+}
+
+/// A host: one IP address seen in traffic, with everything known about it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Node {
+    /// The address.
+    pub label: String,
+    pub packets: u64,
+    pub bytes: u64,
+    /// The related interface, when the shell named one.
     pub iface: Option<IfRef>,
-    /// Hosts only: the special-purpose block that holds the address.
+    /// The special-purpose block that holds the address.
     pub scope: Option<Scope>,
-    /// Hosts only: the latest host name the address was reached by.
+    /// The latest host name the address was reached by.
     pub name: Option<String>,
+    /// Services the host offers, in order of first sight.
+    pub services: Vec<Part>,
+    /// Local programs with sockets on the host, in order of first sight.
+    pub processes: Vec<Part>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1079,7 +1076,9 @@ pub struct Edge {
     pub from: usize,
     pub to: usize,
     pub rel: Rel,
-    pub proto: String,
+    /// Services (`TCP/443`) or protocols (`ICMP`) carried, in order of
+    /// first sight.
+    pub protos: Vec<String>,
     pub packets: u64,
     pub bytes: u64,
 }
@@ -1093,15 +1092,15 @@ pub struct LogEntry {
     pub node: usize,
 }
 
-/// Capture graph: hosts, services, processes and their relations, built
-/// packet by packet over the whole capture.
+/// Capture graph: hosts, each with its services and processes, and the
+/// relations between hosts, built packet by packet over the whole capture.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Graph {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub log: Vec<LogEntry>,
     nodes_by_key: HashMap<String, usize>,
-    edges_by_key: HashMap<(usize, usize, Rel, String), usize>,
+    edges_by_key: HashMap<(usize, usize, Rel), usize>,
 }
 
 impl Graph {
@@ -1119,13 +1118,16 @@ impl Graph {
             } else {
                 (src, dst, sport, &r.sproc, &r.dproc)
             };
-            let svc = self.service(r, server, &format!("{}/{port}", r.proto));
-            let server = self.actor(r, server, server_proc);
-            let client = self.actor(r, client, client_proc);
-            self.edge(r, server, svc, Rel::Serves);
-            self.edge(r, client, svc, Rel::Connects);
+            let svc = format!("{}/{port}", r.proto);
+            self.part(r, server, &svc, true);
+            for (host, process) in [(server, server_proc), (client, client_proc)] {
+                if let Some(name) = process {
+                    self.part(r, host, name, false);
+                }
+            }
+            self.edge(r, client, server, Rel::Connects, &svc);
         } else {
-            self.edge(r, src, dst, Rel::Exchanges);
+            self.edge(r, src, dst, Rel::Exchanges, &r.proto);
         }
     }
 
@@ -1133,19 +1135,49 @@ impl Graph {
         self.edges.iter().filter(|e| e.rel == rel).count()
     }
 
-    pub fn count_kind(&self, f: fn(&Kind) -> bool) -> usize {
-        self.nodes.iter().filter(|n| f(&n.kind)).count()
+    pub fn hosts(&self) -> usize {
+        self.nodes.len()
     }
 
-    pub fn hosts(&self) -> usize {
-        self.count_kind(|k| *k == Kind::Host)
+    /// Services on all hosts.
+    pub fn services(&self) -> usize {
+        self.nodes.iter().map(|n| n.services.len()).sum()
+    }
+
+    /// Processes on all hosts.
+    pub fn processes(&self) -> usize {
+        self.nodes.iter().map(|n| n.processes.len()).sum()
     }
 
     fn host(&mut self, r: &Row, addr: &str, iface: &Option<IfRef>, name: &Option<String>) -> usize {
-        let i = self.node(r, format!("h {addr}"), addr, Kind::Host, || match name {
-            Some(n) => format!("New host {n} ({addr})"),
-            None => format!("New host {addr}"),
-        });
+        let len = u64::from(r.len);
+        let i = match self.nodes_by_key.get(addr) {
+            Some(&i) => {
+                self.nodes[i].packets += 1;
+                self.nodes[i].bytes += len;
+                i
+            }
+            None => {
+                let i = self.nodes.len();
+                self.nodes.push(Node {
+                    label: addr.to_owned(),
+                    packets: 1,
+                    bytes: len,
+                    iface: None,
+                    scope: None,
+                    name: None,
+                    services: Vec::new(),
+                    processes: Vec::new(),
+                });
+                let text = match name {
+                    Some(n) => format!("New host {n} ({addr})"),
+                    None => format!("New host {addr}"),
+                };
+                self.log(r, text, i);
+                self.nodes_by_key.insert(addr.to_owned(), i);
+                i
+            }
+        };
         let node = &mut self.nodes[i];
         if node.iface.is_none() {
             node.iface.clone_from(iface);
@@ -1157,86 +1189,62 @@ impl Graph {
         i
     }
 
-    fn service(&mut self, r: &Row, host: usize, label: &str) -> usize {
-        let on = self.nodes[host].label.clone();
-        let key = format!("s {host} {label}");
-        self.node(r, key, label, Kind::Service { host }, || {
-            format!("New service {label} on {on}")
-        })
-    }
-
-    /// The process on `host` when the shell named one, else the host itself.
-    fn actor(&mut self, r: &Row, host: usize, process: &Option<String>) -> usize {
-        let Some(name) = process else { return host };
-        let on = self.nodes[host].label.clone();
-        let key = format!("p {host} {name}");
-        let p = self.node(r, key, name, Kind::Process { host }, || {
-            format!("New process {name} on {on}")
-        });
-        self.edge(r, p, host, Rel::RunsOn);
-        p
-    }
-
-    fn node(
-        &mut self,
-        r: &Row,
-        key: String,
-        label: &str,
-        kind: Kind,
-        text: impl FnOnce() -> String,
-    ) -> usize {
+    /// Counts the packet into a service (`service`) or process of `host`.
+    fn part(&mut self, r: &Row, host: usize, label: &str, service: bool) {
         let len = u64::from(r.len);
-        if let Some(&i) = self.nodes_by_key.get(&key) {
-            self.nodes[i].packets += 1;
-            self.nodes[i].bytes += len;
-            return i;
-        }
-        let i = self.nodes.len();
-        self.nodes.push(Node {
-            label: label.to_owned(),
-            kind,
-            packets: 1,
-            bytes: len,
-            iface: None,
-            scope: None,
-            name: None,
-        });
-        self.log(r, text(), i);
-        self.nodes_by_key.insert(key, i);
-        i
-    }
-
-    fn edge(&mut self, r: &Row, from: usize, to: usize, rel: Rel) {
-        let len = u64::from(r.len);
-        let proto = if rel == Rel::RunsOn {
-            ""
+        let node = &mut self.nodes[host];
+        let parts = if service {
+            &mut node.services
         } else {
-            r.proto.as_str()
+            &mut node.processes
         };
-        let key = (from, to, rel, proto.to_owned());
-        if let Some(&i) = self.edges_by_key.get(&key) {
-            self.edges[i].packets += 1;
-            self.edges[i].bytes += len;
+        if let Some(p) = parts.iter_mut().find(|p| p.label == label) {
+            p.packets += 1;
+            p.bytes += len;
             return;
         }
-        let (a, b) = (&self.nodes[from].label, &self.nodes[to].label);
-        let text = match (rel, self.nodes[to].kind) {
-            (Rel::Connects, Kind::Service { host }) => {
-                format!("{a} connects to {b} on {}", self.nodes[host].label)
-            }
-            (Rel::Exchanges, _) => format!("{a} exchanges {proto} with {b}"),
-            _ => format!("{a} {} {b}", rel.name()),
-        };
-        self.edges.push(Edge {
-            from,
-            to,
-            rel,
-            proto: proto.to_owned(),
+        parts.push(Part {
+            label: label.to_owned(),
             packets: 1,
             bytes: len,
         });
+        let what = if service { "service" } else { "process" };
+        let text = format!("New {what} {label} on {}", node.label);
+        self.log(r, text, host);
+    }
+
+    fn edge(&mut self, r: &Row, from: usize, to: usize, rel: Rel, proto: &str) {
+        let len = u64::from(r.len);
+        let i = match self.edges_by_key.get(&(from, to, rel)) {
+            Some(&i) => {
+                self.edges[i].packets += 1;
+                self.edges[i].bytes += len;
+                i
+            }
+            None => {
+                self.edges.push(Edge {
+                    from,
+                    to,
+                    rel,
+                    protos: Vec::new(),
+                    packets: 1,
+                    bytes: len,
+                });
+                self.edges_by_key
+                    .insert((from, to, rel), self.edges.len() - 1);
+                self.edges.len() - 1
+            }
+        };
+        if self.edges[i].protos.iter().any(|p| p == proto) {
+            return;
+        }
+        self.edges[i].protos.push(proto.to_owned());
+        let (a, b) = (&self.nodes[from].label, &self.nodes[to].label);
+        let text = match rel {
+            Rel::Connects => format!("{a} connects to {b} on {proto}"),
+            Rel::Exchanges => format!("{a} exchanges {proto} with {b}"),
+        };
         self.log(r, text, from);
-        self.edges_by_key.insert(key, self.edges.len() - 1);
     }
 
     fn log(&mut self, r: &Row, text: String, node: usize) {
@@ -1583,7 +1591,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_builds_services_processes_and_logs_each_fact_once() {
+    fn graph_puts_services_and_processes_on_host_cards() {
         let mut g = Graph::default();
         let mut out = row(1, "10.0.0.1", Some(51000), "10.0.0.2", Some(443), "TCP");
         out.sproc = Some("firefox".into());
@@ -1596,21 +1604,32 @@ mod tests {
             Some(51000),
             "TCP",
         ));
-        g.add(&row(3, "10.0.0.1", None, "10.0.0.2", None, "ICMP"));
-        g.add(&row(4, "", None, "", None, "0x88cc"));
+        g.add(&row(
+            3,
+            "10.0.0.1",
+            Some(51001),
+            "10.0.0.2",
+            Some(80),
+            "TCP",
+        ));
+        g.add(&row(4, "10.0.0.1", None, "10.0.0.2", None, "ICMP"));
+        g.add(&row(5, "", None, "", None, "0x88cc"));
 
+        // Only hosts are nodes; ports and programs are listed on them.
         assert_eq!(g.hosts(), 2);
-        assert_eq!(g.nodes.len(), 4);
-        assert_eq!(g.nodes[2].label, "TCP/443");
-        assert_eq!(g.nodes[2].kind, Kind::Service { host: 1 });
-        assert_eq!((g.nodes[2].packets, g.nodes[2].bytes), (2, 120));
-        assert_eq!(g.nodes[3].kind, Kind::Process { host: 0 });
+        let services: Vec<_> = g.nodes[1]
+            .services
+            .iter()
+            .map(|p| (p.label.as_str(), p.packets, p.bytes))
+            .collect();
+        assert_eq!(services, [("TCP/443", 2, 120), ("TCP/80", 1, 60)]);
+        assert_eq!(g.nodes[0].processes[0].label, "firefox");
+        assert!(g.nodes[0].services.is_empty() && g.nodes[1].processes.is_empty());
         assert_eq!(g.nodes[0].scope.map(|s| s.kind), Some("private"));
-        assert_eq!(
-            [Rel::Serves, Rel::Connects, Rel::Exchanges, Rel::RunsOn].map(|r| g.count(r)),
-            // The reply carries no process name, so the host connects as well.
-            [1, 2, 1, 1]
-        );
+        // One edge per host pair and relation, naming every service used.
+        assert_eq!([Rel::Connects, Rel::Exchanges].map(|r| g.count(r)), [1, 1]);
+        assert_eq!(g.edges[0].protos, ["TCP/443", "TCP/80"]);
+        assert_eq!(g.edges[0].packets, 3);
         let log: Vec<&str> = g.log.iter().map(|e| e.text.as_str()).collect();
         assert_eq!(
             log,
@@ -1619,10 +1638,9 @@ mod tests {
                 "New host 10.0.0.2",
                 "New service TCP/443 on 10.0.0.2",
                 "New process firefox on 10.0.0.1",
-                "firefox runs on 10.0.0.1",
-                "10.0.0.2 serves TCP/443",
-                "firefox connects to TCP/443 on 10.0.0.2",
-                "10.0.0.1 connects to TCP/443 on 10.0.0.2",
+                "10.0.0.1 connects to 10.0.0.2 on TCP/443",
+                "New service TCP/80 on 10.0.0.2",
+                "10.0.0.1 connects to 10.0.0.2 on TCP/80",
                 "10.0.0.1 exchanges ICMP with 10.0.0.2",
             ]
         );

@@ -1489,9 +1489,15 @@ body {
     stroke: var(--secondary);
 }
 
-.edge[data-rel="runs-on"] {
-    stroke: var(--secondary);
-    stroke-dasharray: 1 3;
+/* Services an edge carries, on a halo so it reads over crossing lines. */
+.edge-label {
+    fill: var(--text-muted);
+    font: 500 11px / 1 var(--font-mono);
+    paint-order: stroke;
+    stroke: var(--background);
+    stroke-width: 4px;
+    stroke-linejoin: round;
+    pointer-events: none;
 }
 
 /* Frame around hosts in one private, loopback or link-local block. */
@@ -1510,65 +1516,90 @@ body {
     cursor: pointer;
 }
 
-.node-host circle {
-    fill: var(--primary);
+/* Dragging cards or the background must not select their text. */
+.graph-svg text {
+    user-select: none;
+    -webkit-user-select: none;
 }
 
-.node-service rect {
+/* Host card: a surface card with a primary band on its left edge. */
+.card-box {
     fill: var(--surface);
     stroke: var(--secondary);
+    stroke-width: 1;
+    filter: drop-shadow(0 1px 2px rgb(62 39 35 / 12%));
 }
 
-.node-process rect {
-    fill: var(--text);
-}
-
-.node-label {
-    fill: var(--text);
-    font: var(--type-small);
-    font-family: var(--font-mono);
-}
-
-.node-service .node-label {
+.card-band {
     fill: var(--primary);
 }
 
-.node-note {
+.card-title {
+    fill: var(--text);
+    font: 600 13px / 1 var(--font-body);
+}
+
+.card-sub,
+.card-service,
+.card-process,
+.card-more,
+.card-count {
+    font: 400 11px / 1 var(--font-mono);
+}
+
+.card-sub {
     fill: var(--text-muted);
-    font: var(--type-small);
-    font-size: 11px;
+}
+
+.card-service {
+    fill: var(--primary);
+}
+
+.card-process {
+    fill: var(--text);
+}
+
+.card-more {
+    fill: var(--text-muted);
+    font-style: italic;
+}
+
+.card-count {
+    fill: var(--text-muted);
 }
 
 /* A host whose domain was registered or transferred recently. Before the
-   selected and pinned rings, which override its stroke. */
-.node.flagged circle {
+   selected and pinned outlines, which override its stroke. */
+.node.flagged .card-box {
+    fill: var(--warning-bg);
+    stroke: var(--warning);
+    stroke-width: 2;
+}
+
+.node.flagged .card-band {
     fill: var(--warning);
-    stroke: var(--warning-bg);
-    stroke-width: 4;
 }
 
-.node.flagged .node-label {
+.node.flagged .card-title {
     fill: var(--warning-text);
-    font-weight: 600;
 }
 
-/* Inspected node: a solid dark ring. Pinned nodes: a dashed one. */
-.node.selected circle,
-.node.selected rect {
+/* Inspected card: a solid dark outline. Pinned cards: a dashed one. */
+.node.selected .card-box {
     stroke: var(--text);
-    stroke-width: 3;
+    stroke-width: 2.5;
 }
 
-.node.pinned:not(.selected) circle,
-.node.pinned:not(.selected) rect {
+.node.pinned:not(.selected) .card-box {
     stroke: var(--text);
-    stroke-dasharray: 2 2;
+    stroke-dasharray: 4 3;
     stroke-width: 1.5;
 }
 
 /* While a node is inspected, everything it does not touch fades. */
 .node.dim,
-.edge.dim {
+.edge.dim,
+.edge-label.dim {
     opacity: 0.18;
 }
 
