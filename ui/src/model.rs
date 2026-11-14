@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use serde::{Deserialize, Serialize};
 
 /// One captured packet, as the shell sends it. Serialize is for the JSON export.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Row {
     pub no: u64,
     pub time: String,
@@ -49,7 +49,7 @@ pub struct Row {
 }
 
 /// Registration data of a domain seen in traffic, as the shell sends it.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 pub struct DomainInfo {
     pub name: String,
     /// Registrable domain the dates belong to.
@@ -89,7 +89,7 @@ impl DomainInfo {
 /// Domain data by host name.
 pub type Domains = HashMap<String, DomainInfo>;
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct IfRef {
     pub name: String,
     /// True for an address of this host, false for one on the interface's network.
@@ -189,7 +189,7 @@ impl Row {
 
     /// True when `other` is in the same conversation: same protocol and the
     /// same two endpoints, in either direction.
-    pub fn same_conversation(&self, other: &Row) -> bool {
+    pub fn same_conversation(&self, other: &Self) -> bool {
         self.proto == other.proto
             && (self.same_direction(other) && self.dst == other.dst && self.dport == other.dport
                 || self.src == other.dst
@@ -199,15 +199,18 @@ impl Row {
     }
 
     /// True when `other` leaves from the same endpoint as this packet.
-    pub fn same_direction(&self, other: &Row) -> bool {
+    pub fn same_direction(&self, other: &Self) -> bool {
         self.src == other.src && self.sport == other.sport
     }
 
     /// `addr:port` of each end, as the proxy writes socket addresses.
     fn sockets(&self) -> Option<(String, String)> {
-        let sock = |a: &str, p: u16| match a.contains(':') {
-            true => format!("[{a}]:{p}"),
-            false => format!("{a}:{p}"),
+        let sock = |a: &str, p: u16| {
+            if a.contains(':') {
+                format!("[{a}]:{p}")
+            } else {
+                format!("{a}:{p}")
+            }
         };
         Some((sock(&self.src, self.sport?), sock(&self.dst, self.dport?)))
     }
@@ -223,7 +226,7 @@ impl Row {
 }
 
 /// Packet detail from the shell, for the inspector.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 pub struct Inspection {
     pub no: u64,
     /// Network-layer bytes, possibly cut short of `caplen`.
@@ -238,7 +241,7 @@ pub struct Inspection {
 }
 
 /// Data one side sent before the other answered.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 pub struct Turn {
     /// Sent by the side that spoke first: the client, usually.
     pub client: bool,
@@ -251,7 +254,7 @@ pub struct Turn {
 }
 
 /// A request and its response, decrypted by the HTTPS proxy.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 pub struct Exchange {
     pub id: u64,
     pub conn: u64,
@@ -281,7 +284,7 @@ pub struct Exchange {
     pub remote: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 pub struct Body {
     pub size: usize,
     pub data: Vec<u8>,
@@ -290,7 +293,7 @@ pub struct Body {
 }
 
 /// State of the HTTPS proxy.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 pub struct MitmState {
     pub on: bool,
     /// Port the redirected traffic reaches the proxy on.
@@ -375,14 +378,14 @@ fn endpoint(addr: &str, port: Option<u16>) -> String {
 }
 
 /// A special-purpose address block that holds an address.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Scope {
     pub cidr: &'static str,
     /// `private`, `loopback`, `link-local`, `shared`, `multicast` or `broadcast`.
     pub kind: &'static str,
 }
 
-/// IPv4 blocks of RFC 6890 that do not route on the public internet.
+/// `IPv4` blocks of RFC 6890 that do not route on the public internet.
 const V4_SCOPES: [(u32, u32, &str, &str); 8] = [
     (0x0a00_0000, 8, "10.0.0.0/8", "private"),
     (0xac10_0000, 12, "172.16.0.0/12", "private"),
@@ -435,7 +438,7 @@ pub const SCOPES: [&str; 6] = [
 ];
 
 /// Filter dialog settings. An empty set or `None` places no limit.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Rules {
     /// Protocols as the table shows them (`https`, `TCP`, `ARP`).
     pub protocols: BTreeSet<String>,
@@ -586,9 +589,9 @@ pub struct Filter {
 /// Parsed search expression.
 #[derive(Clone, Debug, PartialEq)]
 enum Expr {
-    All(Vec<Expr>),
-    Any(Vec<Expr>),
-    Not(Box<Expr>),
+    All(Vec<Self>),
+    Any(Vec<Self>),
+    Not(Box<Self>),
     Term(Term),
 }
 
@@ -618,7 +621,7 @@ enum Tok {
 }
 
 /// Characters that end an unquoted term.
-fn ends_term(c: char) -> bool {
+const fn ends_term(c: char) -> bool {
     c.is_whitespace() || matches!(c, '|' | '&' | '(' | ')' | '"')
 }
 
@@ -727,11 +730,10 @@ impl Parser {
 /// itself; nothing left matches every row.
 fn flatten(mut items: Vec<Expr>, make: fn(Vec<Expr>) -> Expr) -> Expr {
     items.retain(|e| *e != Expr::default());
-    match items.len() {
-        0 => Expr::default(),
-        1 => items.pop().expect("one item"),
-        _ => make(items),
+    if items.len() > 1 {
+        return make(items);
     }
+    items.pop().unwrap_or_default()
 }
 
 impl Expr {
@@ -799,7 +801,7 @@ impl Filter {
 }
 
 /// Sortable table columns.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Col {
     No,
     Time,
@@ -831,7 +833,7 @@ fn addr_key(addr: &str, port: Option<u16>) -> (Option<IpAddr>, &str, Option<u16>
 }
 
 /// Packets of one flow folded into its newest row.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Stack {
     pub count: u32,
     pub min_len: u32,
@@ -841,10 +843,38 @@ pub struct Stack {
 
 /// Rows the table shows: indices into the capture in display order and,
 /// when repeats are collapsed, the stack each shown row stands for.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TableView {
     pub rows: Vec<usize>,
     pub stacks: HashMap<usize, Stack>,
+}
+
+/// Folds the `shown` rows of each flow into its newest row. Returns the
+/// newest rows in arrival order, and the stacks of flows with more than one.
+fn fold_flows(rows: &[Row], shown: Vec<usize>) -> (Vec<usize>, HashMap<usize, Stack>) {
+    let mut slot: HashMap<_, usize> = HashMap::new();
+    let mut groups: Vec<(usize, Stack)> = Vec::new();
+    for i in shown {
+        let r = &rows[i];
+        let at = *slot.entry(r.flow_key()).or_insert_with(|| {
+            groups.push((i, Stack::default()));
+            groups.len() - 1
+        });
+        let (newest, s) = &mut groups[at];
+        *newest = i;
+        s.min_len = if s.count == 0 {
+            r.len
+        } else {
+            s.min_len.min(r.len)
+        };
+        s.max_len = s.max_len.max(r.len);
+        s.count += 1;
+        s.bytes += u64::from(r.len);
+    }
+    let mut newest: Vec<usize> = groups.iter().map(|g| g.0).collect();
+    newest.sort_unstable();
+    let stacks = groups.into_iter().filter(|g| g.1.count > 1).collect();
+    (newest, stacks)
 }
 
 /// Filters, optionally collapses and sorts `rows`. `keep` is the filter;
@@ -855,33 +885,12 @@ pub fn table_view(
     collapse: bool,
     (col, desc): (Col, bool),
 ) -> TableView {
-    let mut shown: Vec<usize> = (0..rows.len()).filter(|&i| keep(&rows[i])).collect();
-    let mut stacks = HashMap::new();
-    if collapse {
-        let mut slot: HashMap<_, usize> = HashMap::new();
-        let mut groups: Vec<(usize, Stack)> = Vec::new();
-        for i in shown {
-            let r = &rows[i];
-            let at = *slot.entry(r.flow_key()).or_insert_with(|| {
-                groups.push((i, Stack::default()));
-                groups.len() - 1
-            });
-            let (newest, s) = &mut groups[at];
-            *newest = i;
-            s.min_len = if s.count == 0 {
-                r.len
-            } else {
-                s.min_len.min(r.len)
-            };
-            s.max_len = s.max_len.max(r.len);
-            s.count += 1;
-            s.bytes += u64::from(r.len);
-        }
-        shown = groups.iter().map(|g| g.0).collect();
-        // Arrival order of the newest packet of each flow.
-        shown.sort_unstable();
-        stacks = groups.into_iter().filter(|g| g.1.count > 1).collect();
-    }
+    let shown: Vec<usize> = (0..rows.len()).filter(|&i| keep(&rows[i])).collect();
+    let (mut shown, stacks) = if collapse {
+        fold_flows(rows, shown)
+    } else {
+        (shown, HashMap::new())
+    };
     // Rows arrive in number order, so that order needs no sort.
     if !matches!(col, Col::No | Col::Time) {
         shown.sort_by(|&a, &b| compare(&rows[a], &rows[b], col));
@@ -895,7 +904,7 @@ pub fn table_view(
     }
 }
 
-/// Address prefix lengths the network view groups by: (IPv4, IPv6).
+/// Address prefix lengths the network view groups by: (`IPv4`, `IPv6`).
 pub const GROUPINGS: [(&str, u8, u8); 3] = [
     ("/24 · /64", 24, 64),
     ("/16 · /48", 16, 48),
@@ -903,7 +912,7 @@ pub const GROUPINGS: [(&str, u8, u8); 3] = [
 ];
 
 /// Traffic of one address.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HostStat {
     pub packets: u64,
     pub bytes: u64,
@@ -913,7 +922,7 @@ pub struct HostStat {
 }
 
 /// Per-address totals, updated as rows arrive.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Hosts(pub HashMap<IpAddr, HostStat>);
 
 impl Hosts {
@@ -938,7 +947,7 @@ impl Hosts {
 }
 
 /// One address block and the addresses seen in it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Block {
     pub cidr: Cidr,
     /// Special-purpose block (`private`, `loopback`) that holds it, if any.
@@ -1035,17 +1044,17 @@ pub enum Rel {
 }
 
 impl Rel {
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
-            Rel::Connects => "connects to",
-            Rel::Exchanges => "exchanges",
+            Self::Connects => "connects to",
+            Self::Exchanges => "exchanges",
         }
     }
 }
 
 /// Something a host card lists: a service it offers (`TCP/443`) or a
 /// local program with sockets on it (`firefox`), with its traffic.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Part {
     pub label: String,
     pub packets: u64,
@@ -1053,7 +1062,7 @@ pub struct Part {
 }
 
 /// A host: one IP address seen in traffic, with everything known about it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Node {
     /// The address.
     pub label: String,
@@ -1071,7 +1080,7 @@ pub struct Node {
     pub processes: Vec<Part>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Edge {
     pub from: usize,
     pub to: usize,
@@ -1084,7 +1093,7 @@ pub struct Edge {
 }
 
 /// One step of the graph build: when a node or edge first appeared.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogEntry {
     pub time: String,
     pub text: String,
@@ -1094,7 +1103,7 @@ pub struct LogEntry {
 
 /// Capture graph: hosts, each with its services and processes, and the
 /// relations between hosts, built packet by packet over the whole capture.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Graph {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
@@ -1108,8 +1117,8 @@ impl Graph {
         if r.src.is_empty() || r.dst.is_empty() {
             return;
         }
-        let src = self.host(r, &r.src, &r.src_if, &r.src_name);
-        let dst = self.host(r, &r.dst, &r.dst_if, &r.dst_name);
+        let src = self.host(r, &r.src, r.src_if.as_ref(), r.src_name.as_ref());
+        let dst = self.host(r, &r.dst, r.dst_if.as_ref(), r.dst_name.as_ref());
         if let (Some(sport), Some(dport)) = (r.sport, r.dport) {
             // shortcut: the lower port is taken as the service, so traffic between two
             // high ports may pick the wrong side; track SYN direction if that matters.
@@ -1135,7 +1144,7 @@ impl Graph {
         self.edges.iter().filter(|e| e.rel == rel).count()
     }
 
-    pub fn hosts(&self) -> usize {
+    pub const fn hosts(&self) -> usize {
         self.nodes.len()
     }
 
@@ -1149,41 +1158,38 @@ impl Graph {
         self.nodes.iter().map(|n| n.processes.len()).sum()
     }
 
-    fn host(&mut self, r: &Row, addr: &str, iface: &Option<IfRef>, name: &Option<String>) -> usize {
+    fn host(&mut self, r: &Row, addr: &str, iface: Option<&IfRef>, name: Option<&String>) -> usize {
         let len = u64::from(r.len);
-        let i = match self.nodes_by_key.get(addr) {
-            Some(&i) => {
-                self.nodes[i].packets += 1;
-                self.nodes[i].bytes += len;
-                i
-            }
-            None => {
-                let i = self.nodes.len();
-                self.nodes.push(Node {
-                    label: addr.to_owned(),
-                    packets: 1,
-                    bytes: len,
-                    iface: None,
-                    scope: None,
-                    name: None,
-                    services: Vec::new(),
-                    processes: Vec::new(),
-                });
-                let text = match name {
-                    Some(n) => format!("New host {n} ({addr})"),
-                    None => format!("New host {addr}"),
-                };
-                self.log(r, text, i);
-                self.nodes_by_key.insert(addr.to_owned(), i);
-                i
-            }
+        let i = if let Some(&i) = self.nodes_by_key.get(addr) {
+            self.nodes[i].packets += 1;
+            self.nodes[i].bytes += len;
+            i
+        } else {
+            let i = self.nodes.len();
+            self.nodes.push(Node {
+                label: addr.to_owned(),
+                packets: 1,
+                bytes: len,
+                iface: None,
+                scope: None,
+                name: None,
+                services: Vec::new(),
+                processes: Vec::new(),
+            });
+            let text = name.map_or_else(
+                || format!("New host {addr}"),
+                |n| format!("New host {n} ({addr})"),
+            );
+            self.log(r, text, i);
+            self.nodes_by_key.insert(addr.to_owned(), i);
+            i
         };
         let node = &mut self.nodes[i];
         if node.iface.is_none() {
-            node.iface.clone_from(iface);
+            node.iface = iface.cloned();
         }
         if name.is_some() {
-            node.name.clone_from(name);
+            node.name = name.cloned();
         }
         node.scope = scope(addr);
         i
@@ -1215,25 +1221,22 @@ impl Graph {
 
     fn edge(&mut self, r: &Row, from: usize, to: usize, rel: Rel, proto: &str) {
         let len = u64::from(r.len);
-        let i = match self.edges_by_key.get(&(from, to, rel)) {
-            Some(&i) => {
-                self.edges[i].packets += 1;
-                self.edges[i].bytes += len;
-                i
-            }
-            None => {
-                self.edges.push(Edge {
-                    from,
-                    to,
-                    rel,
-                    protos: Vec::new(),
-                    packets: 1,
-                    bytes: len,
-                });
-                self.edges_by_key
-                    .insert((from, to, rel), self.edges.len() - 1);
-                self.edges.len() - 1
-            }
+        let i = if let Some(&i) = self.edges_by_key.get(&(from, to, rel)) {
+            self.edges[i].packets += 1;
+            self.edges[i].bytes += len;
+            i
+        } else {
+            self.edges.push(Edge {
+                from,
+                to,
+                rel,
+                protos: Vec::new(),
+                packets: 1,
+                bytes: len,
+            });
+            self.edges_by_key
+                .insert((from, to, rel), self.edges.len() - 1);
+            self.edges.len() - 1
         };
         if self.edges[i].protos.iter().any(|p| p == proto) {
             return;
@@ -1331,7 +1334,7 @@ mod tests {
     #[test]
     fn units() {
         assert_eq!(
-            [duration(0.000166), duration(0.0425), duration(3.0)],
+            [duration(0.000_166), duration(0.0425), duration(3.0)],
             ["166 µs", "42.5 ms", "3.00 s"]
         );
         assert_eq!(
@@ -1472,13 +1475,17 @@ mod tests {
 
     #[test]
     fn cidr_blocks_and_filter() {
-        let c = Cidr::parse("10.88.7.9/16").unwrap();
-        assert_eq!(c.to_string(), "10.88.0.0/16");
-        assert!(c.contains("10.88.255.1".parse().unwrap()));
-        assert!(!c.contains("10.89.0.1".parse().unwrap()));
-        assert!(!c.contains("::a58:1".parse().unwrap()));
-        assert_eq!(Cidr::parse("fd00::1/64").unwrap().to_string(), "fd00::/64");
-        assert_eq!(Cidr::parse("0.0.0.0/0").unwrap().to_string(), "0.0.0.0/0");
+        let text = |cidr: &str| Cidr::parse(cidr).map(|c| c.to_string());
+        let inside = |ip: &str| {
+            let ip = ip.parse().ok()?;
+            Cidr::parse("10.88.7.9/16").map(|c| c.contains(ip))
+        };
+        assert_eq!(text("10.88.7.9/16").as_deref(), Some("10.88.0.0/16"));
+        assert_eq!(inside("10.88.255.1"), Some(true));
+        assert_eq!(inside("10.89.0.1"), Some(false));
+        assert_eq!(inside("::a58:1"), Some(false));
+        assert_eq!(text("fd00::1/64").as_deref(), Some("fd00::/64"));
+        assert_eq!(text("0.0.0.0/0").as_deref(), Some("0.0.0.0/0"));
         assert_eq!(Cidr::parse("10.0.0.0/33"), None);
 
         let r = row(
@@ -1576,7 +1583,7 @@ mod tests {
         let mut r = row(1, "10.0.0.1", Some(1), "10.0.0.2", Some(2), "TCP");
         r.info = "=HYPERLINK(\"x\"), b".into();
         let out = csv([&r]);
-        let line = out.lines().nth(1).unwrap();
+        let line = out.lines().nth(1).unwrap_or_default();
         assert!(out.starts_with("no,time,source,"));
         assert!(line.ends_with(",\"'=HYPERLINK(\"\"x\"\"), b\""), "{line}");
         assert_eq!(line.split(',').next(), Some("1"));

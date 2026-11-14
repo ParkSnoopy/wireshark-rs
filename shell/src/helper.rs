@@ -1,15 +1,19 @@
 //! The privileged helper (`src/bin/wireshark-capture.rs`), seen from the GUI.
 //!
-//! `launch` runs it once through pkexec and receives an unbound AF_PACKET
-//! socket. The helper then stays and answers the commands of
+//! `launch` runs it once through pkexec and receives an `AF_PACKET` socket
+//! that drops every packet until a capture starts. The helper then stays
+//! and answers the commands of
 //! `helper_proto` over the same connection; dropping `Helper` closes it,
 //! which makes the helper undo any interception and exit.
 
-use std::io::{self, Read};
-use std::mem;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::io::{self, IoSliceMut, Read, Write};
+use std::mem::MaybeUninit;
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, PoisonError};
+
+use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendFlags};
 
 use crate::helper_proto::{PEM_BEGIN, PEM_END};
 
@@ -19,30 +23,18 @@ const PKEXEC: &str = "/usr/bin/pkexec";
 /// Longest reply line.
 const REPLY_MAX: usize = 4096;
 
+/// The connection to the running helper.
+#[derive(Debug)]
 pub struct Helper {
     /// One command at a time: a reply belongs to the last request.
-    control: Mutex<OwnedFd>,
+    control: Mutex<UnixStream>,
 }
 
 /// Runs the helper through pkexec and returns the packet socket it sends,
 /// and the connection for later commands. Blocks until the user answers
 /// the authorization dialog.
 pub fn launch() -> io::Result<(OwnedFd, Helper)> {
-    let mut fds = [0; 2];
-    // SAFETY: fds has room for the two descriptors socketpair writes.
-    if unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-            0,
-            fds.as_mut_ptr(),
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: socketpair returned two new descriptors that nothing else owns.
-    let (ours, theirs) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let (ours, theirs) = UnixStream::pair()?;
 
     // Run only the helper installed next to this binary. pkexec needs an absolute path.
     let helper = std::env::current_exe()?.with_file_name(HELPER);
@@ -52,11 +44,13 @@ pub fn launch() -> io::Result<(OwnedFd, Helper)> {
     let mut child = Command::new(PKEXEC)
         .arg(helper)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(theirs))
+        .stdout(Stdio::from(OwnedFd::from(theirs)))
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| io::Error::other(format!("cannot run {PKEXEC}: {e}")))?;
-    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let Some(mut stderr) = child.stderr.take() else {
+        return Err(io::Error::other("the helper's error output is not piped"));
+    };
 
     match receive(&ours) {
         Ok((reply, Some(fd))) if reply == "ok" => {
@@ -64,7 +58,7 @@ pub fn launch() -> io::Result<(OwnedFd, Helper)> {
             std::thread::spawn(move || {
                 let mut text = String::new();
                 let _ = stderr.read_to_string(&mut text);
-                eprint!("{text}");
+                let _ = io::stderr().write_all(text.as_bytes());
                 let _ = child.wait();
             });
             Ok((
@@ -114,24 +108,13 @@ impl Helper {
         let control = self.control.lock().unwrap_or_else(PoisonError::into_inner);
         let mut sent = 0;
         while sent < command.len() {
-            // SAFETY: the pointer and length describe the unsent part of `command`.
-            let n = unsafe {
-                libc::send(
-                    control.as_raw_fd(),
-                    command[sent..].as_ptr().cast(),
-                    command.len() - sent,
-                    libc::MSG_NOSIGNAL,
-                )
-            };
-            if n < 0 {
-                return Err(io::Error::other(format!(
-                    "the capture helper is gone: {}",
-                    io::Error::last_os_error()
-                )));
-            }
-            sent += n.cast_unsigned();
+            // Not `write`: without MSG_NOSIGNAL a gone helper raises SIGPIPE.
+            sent += rustix::net::send(&*control, &command.as_bytes()[sent..], SendFlags::NOSIGNAL)
+                .map_err(|e| io::Error::other(format!("the capture helper is gone: {e}")))?;
         }
-        match receive(&control)? {
+        let answer = receive(&control)?;
+        drop(control);
+        match answer {
             (reply, fd) if reply == "ok" => Ok((reply, fd)),
             (reply, _) => Err(io::Error::other(
                 reply.strip_prefix("error: ").unwrap_or(&reply).to_owned(),
@@ -141,46 +124,28 @@ impl Helper {
 }
 
 /// Receives one reply line and the descriptor sent with it, if any.
-fn receive(sock: &OwnedFd) -> io::Result<(String, Option<OwnedFd>)> {
+fn receive(sock: &UnixStream) -> io::Result<(String, Option<OwnedFd>)> {
     let mut line = Vec::new();
     let mut fd = None;
     while !line.ends_with(b"\n") {
         let mut buf = [0u8; 512];
-        let mut iov = libc::iovec {
-            iov_base: buf.as_mut_ptr().cast(),
-            iov_len: buf.len(),
-        };
-        // u64 storage keeps the control buffer aligned for cmsghdr.
-        let mut control = [0u64; 4];
-        // SAFETY: msghdr is a plain C struct; all-zero is a valid value.
-        let mut msg: libc::msghdr = unsafe { mem::zeroed() };
-        msg.msg_iov = &raw mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = mem::size_of_val(&control);
-        // SAFETY: msg and everything it points to stay valid during the call.
-        let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &raw mut msg, libc::MSG_CMSG_CLOEXEC) };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if n == 0 {
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut control = RecvAncillaryBuffer::new(&mut space);
+        let msg = rustix::net::recvmsg(
+            sock,
+            &mut [IoSliceMut::new(&mut buf)],
+            &mut control,
+            RecvFlags::CMSG_CLOEXEC,
+        )?;
+        if msg.bytes == 0 {
             return Err(io::Error::other("the capture helper exited"));
         }
-        // SAFETY: recvmsg filled msg; CMSG_FIRSTHDR returns null or a header inside control.
-        let cmsg = unsafe { libc::CMSG_FIRSTHDR(&raw const msg) };
-        // SAFETY: cmsg is checked for null before it is read.
-        if !cmsg.is_null()
-            && unsafe {
-                (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS
+        for message in control.drain() {
+            if let RecvAncillaryMessage::ScmRights(mut fds) = message {
+                fd = fd.or_else(|| fds.next());
             }
-        {
-            // SAFETY: an SCM_RIGHTS header carries at least one int; the kernel
-            // installed that descriptor in this process and nothing else owns it.
-            fd = Some(unsafe {
-                OwnedFd::from_raw_fd(libc::CMSG_DATA(cmsg).cast::<libc::c_int>().read_unaligned())
-            });
         }
-        line.extend_from_slice(&buf[..n.cast_unsigned()]);
+        line.extend_from_slice(buf.get(..msg.bytes).unwrap_or(&buf));
         if line.len() > REPLY_MAX {
             return Err(io::Error::other("reply too long"));
         }

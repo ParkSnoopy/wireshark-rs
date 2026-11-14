@@ -41,15 +41,16 @@ mod tests {
 
     #[test]
     fn answers_label_later_packets() {
+        let ip = IpAddr::from([93, 184, 216, 34]);
         let mut names = Names::default();
         let mut dns = parse::row(1, 0, 0, 0x88cc, &[]);
-        dns.learned = vec![("93.184.216.34".parse().unwrap(), "example.com".into())];
+        dns.learned = vec![(ip, "example.com".into())];
         assert_eq!(names.annotate(&mut dns), ["example.com"]);
 
         let mut r = parse::row(2, 0, 0, 0x88cc, &[]);
-        r.dst = "93.184.216.34".into();
-        r.learned = vec![("93.184.216.34".parse().unwrap(), "example.com".into())];
-        assert!(names.annotate(&mut r).is_empty());
+        r.dst = ip.to_string();
+        r.learned = vec![(ip, "example.com".into())];
+        assert_eq!(names.annotate(&mut r), Vec::<String>::new());
         assert_eq!(
             (r.src_name, r.dst_name.as_deref()),
             (None, Some("example.com"))

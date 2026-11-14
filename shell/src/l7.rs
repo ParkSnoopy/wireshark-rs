@@ -4,7 +4,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct L7 {
     /// Lowercase protocol name, like `https` or `dns`.
     pub app: Option<&'static str>,
@@ -42,10 +42,10 @@ pub fn inspect(tcp: bool, sport: u16, dport: u16, payload: &[u8]) -> L7 {
             match payload.get(5) {
                 Some(1) => {
                     l7.server_name = sni(payload);
-                    l7.info = Some(match &l7.server_name {
-                        Some(name) => format!("Client Hello, SNI {name}"),
-                        None => "Client Hello".to_owned(),
-                    });
+                    l7.info = Some(l7.server_name.as_ref().map_or_else(
+                        || "Client Hello".to_owned(),
+                        |name| format!("Client Hello, SNI {name}"),
+                    ));
                 }
                 Some(2) => l7.info = Some("Server Hello".to_owned()),
                 _ => {}
@@ -79,7 +79,7 @@ pub fn inspect(tcp: bool, sport: u16, dport: u16, payload: &[u8]) -> L7 {
 }
 
 /// IANA service name for a well-known port.
-fn by_port(tcp: bool, port: u16) -> Option<&'static str> {
+const fn by_port(tcp: bool, port: u16) -> Option<&'static str> {
     Some(match (tcp, port) {
         (true, 20) => "ftp-data",
         (true, 21) => "ftp",
@@ -167,7 +167,7 @@ fn http_host(d: &[u8]) -> Option<String> {
     hostname(host.as_bytes())
 }
 
-/// Server name from a TLS ClientHello whose record starts at `d[0]`.
+/// Server name from a TLS `ClientHello` whose record starts at `d[0]`.
 fn sni(d: &[u8]) -> Option<String> {
     // Record header (5), handshake header (4), version (2), random (32).
     let mut at = 5 + 4 + 2 + 32;
@@ -202,8 +202,11 @@ fn hostname(b: &[u8]) -> Option<String> {
     })
 }
 
+/// Addresses a DNS answer names, each with its host name.
+type Answers = Vec<(IpAddr, String)>;
+
 /// Info text and A/AAAA answers of a DNS message.
-fn dns(d: &[u8], mdns: bool) -> Option<(String, Vec<(IpAddr, String)>)> {
+fn dns(d: &[u8], mdns: bool) -> Option<(String, Answers)> {
     let flags = be16(d, 2)?;
     let (questions, answers) = (be16(d, 4)?, be16(d, 6)?);
     let mut at = 12;
@@ -326,7 +329,7 @@ mod tests {
         assert_eq!(
             l7.answers,
             [(
-                "93.184.216.34".parse().unwrap(),
+                IpAddr::from([93, 184, 216, 34]),
                 "www.example.com".to_owned()
             )]
         );

@@ -6,11 +6,13 @@
 //! user's processes are readable, so sockets of other users stay unnamed.
 
 use std::collections::HashMap;
-use std::ffi::CStr;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::time::{Duration, Instant};
+
+use nix::ifaddrs::getifaddrs;
+use nix::sys::socket::SockaddrStorage;
 
 use crate::parse::{IfRef, Row};
 
@@ -217,62 +219,34 @@ fn in_network(ip: IpAddr, net: IpAddr, prefix: u32) -> bool {
 
 /// Addresses and prefixes of all interfaces, from getifaddrs(3).
 fn networks() -> std::io::Result<Vec<Net>> {
-    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: list is a valid out pointer; freeifaddrs releases it below.
-    if unsafe { libc::getifaddrs(&raw mut list) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
     let mut nets = Vec::new();
-    let mut cur = list;
-    while !cur.is_null() {
-        // SAFETY: cur is a node of the list getifaddrs returned and is not freed yet.
-        let ifa = unsafe { &*cur };
-        cur = ifa.ifa_next;
-        // SAFETY: ifa_addr and ifa_netmask are null or point to a sockaddr of the
-        // family in sa_family; ifa_name is a NUL-terminated string.
-        let (addr, mask) = unsafe { (sock_ip(ifa.ifa_addr), sock_ip(ifa.ifa_netmask)) };
-        let (Some(addr), Some(mask)) = (addr, mask) else {
+    for ifa in getifaddrs().map_err(std::io::Error::from)? {
+        let ip = |sa: Option<SockaddrStorage>| {
+            let sa = sa?;
+            sa.as_sockaddr_in()
+                .map(|v4| IpAddr::V4(v4.ip()))
+                .or_else(|| sa.as_sockaddr_in6().map(|v6| IpAddr::V6(v6.ip())))
+        };
+        let (Some(addr), Some(mask)) = (ip(ifa.address), ip(ifa.netmask)) else {
             continue;
         };
         let prefix = match mask {
             IpAddr::V4(m) => u32::from(m).count_ones(),
             IpAddr::V6(m) => u128::from(m).count_ones(),
         };
-        // SAFETY: see above.
-        let name = unsafe { CStr::from_ptr(ifa.ifa_name) }
-            .to_string_lossy()
-            .into_owned();
-        nets.push(Net { name, addr, prefix });
+        nets.push(Net {
+            name: ifa.interface_name,
+            addr,
+            prefix,
+        });
     }
-    // SAFETY: list came from getifaddrs and is freed once.
-    unsafe { libc::freeifaddrs(list) };
     Ok(nets)
-}
-
-/// # Safety
-/// `sa` must be null or point to a valid sockaddr of the family it names.
-unsafe fn sock_ip(sa: *const libc::sockaddr) -> Option<IpAddr> {
-    if sa.is_null() {
-        return None;
-    }
-    // SAFETY: the caller guarantees the struct matches sa_family.
-    unsafe {
-        match i32::from((*sa).sa_family) {
-            libc::AF_INET => {
-                let v4 = &*sa.cast::<libc::sockaddr_in>();
-                Some(IpAddr::V4(Ipv4Addr::from(v4.sin_addr.s_addr.to_ne_bytes())))
-            }
-            libc::AF_INET6 => {
-                let v6 = &*sa.cast::<libc::sockaddr_in6>();
-                Some(IpAddr::V6(Ipv6Addr::from(v6.sin6_addr.s6_addr)))
-            }
-            _ => None,
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
 
     #[test]
@@ -284,19 +258,22 @@ mod tests {
         );
         assert_eq!(
             parse_socket_line(&line),
-            Some(("127.0.0.1".parse().unwrap(), 8080, 4242))
+            Some((IpAddr::from([127, 0, 0, 1]), 8080, 4242))
         );
 
-        let mapped: Vec<String> = Ipv4Addr::new(10, 0, 0, 7)
-            .to_ipv6_mapped()
-            .octets()
-            .chunks(4)
-            .map(|c| format!("{:08X}", u32::from_ne_bytes(c.try_into().unwrap())))
-            .collect();
-        let line = format!("   1: {}:0035 0 0A 0 0 0 1000 0 77 1", mapped.concat());
+        let octets = Ipv4Addr::new(10, 0, 0, 7).to_ipv6_mapped().octets();
+        let mapped = octets
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .fold(String::new(), |mut text, c| {
+                let _ = write!(text, "{:08X}", u32::from_ne_bytes(*c));
+                text
+            });
+        let line = format!("   1: {mapped}:0035 0 0A 0 0 0 1000 0 77 1");
         assert_eq!(
             parse_socket_line(&line),
-            Some(("10.0.0.7".parse().unwrap(), 53, 77))
+            Some((IpAddr::from([10, 0, 0, 7]), 53, 77))
         );
 
         // Inode 0 is a socket in TIME_WAIT without an owner.
@@ -310,21 +287,21 @@ mod tests {
             nets: vec![
                 Net {
                     name: "podman0".into(),
-                    addr: "10.88.0.1".parse().unwrap(),
+                    addr: IpAddr::from([10, 88, 0, 1]),
                     prefix: 16,
                 },
                 Net {
                     name: "lo".into(),
-                    addr: "127.0.0.1".parse().unwrap(),
+                    addr: IpAddr::from([127, 0, 0, 1]),
                     prefix: 8,
                 },
             ],
             ..Owners::default()
         };
-        let at = |ip: &str| owners.iface(ip.parse().unwrap()).map(|i| (i.name, i.local));
-        assert_eq!(at("10.88.0.1"), Some(("podman0".into(), true)));
-        assert_eq!(at("10.88.3.9"), Some(("podman0".into(), false)));
-        assert_eq!(at("127.0.0.53"), Some(("lo".into(), true)));
-        assert_eq!(at("8.8.8.8"), None);
+        let at = |ip: [u8; 4]| owners.iface(IpAddr::from(ip)).map(|i| (i.name, i.local));
+        assert_eq!(at([10, 88, 0, 1]), Some(("podman0".into(), true)));
+        assert_eq!(at([10, 88, 3, 9]), Some(("podman0".into(), false)));
+        assert_eq!(at([127, 0, 0, 53]), Some(("lo".into(), true)));
+        assert_eq!(at([8, 8, 8, 8]), None);
     }
 }

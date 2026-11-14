@@ -8,10 +8,9 @@ const CARD_WIDTH: i32 = 380;
 const CARD_GAP: i32 = 18;
 const ARROW_INSET: i32 = 22;
 
-/// Card below and right of `cursor` (client px); flips when that would
-/// leave the window.
-#[component]
-pub fn Tip(cursor: RwSignal<(i32, i32)>, children: Children) -> impl IntoView {
+/// Card holding `content` below and right of `cursor` (client px); flips
+/// when that would leave the window.
+pub fn tip(cursor: RwSignal<(i32, i32)>, content: impl IntoView) -> impl IntoView {
     let placement = move || {
         let (x, y) = cursor.get();
         let (width, height) = viewport();
@@ -44,7 +43,7 @@ pub fn Tip(cursor: RwSignal<(i32, i32)>, children: Children) -> impl IntoView {
             data-side=move || placement().1
             data-align=move || placement().2
         >
-            {children()}
+            {content}
         </div>
     }
 }

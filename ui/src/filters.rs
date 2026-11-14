@@ -18,21 +18,21 @@ enum Group {
 }
 
 impl Group {
-    fn of(self, r: &Rules) -> &BTreeSet<String> {
+    const fn of(self, r: &Rules) -> &BTreeSet<String> {
         match self {
-            Group::Protocols => &r.protocols,
-            Group::Scopes => &r.scopes,
-            Group::Ifaces => &r.ifaces,
-            Group::Processes => &r.processes,
+            Self::Protocols => &r.protocols,
+            Self::Scopes => &r.scopes,
+            Self::Ifaces => &r.ifaces,
+            Self::Processes => &r.processes,
         }
     }
 
-    fn of_mut(self, r: &mut Rules) -> &mut BTreeSet<String> {
+    const fn of_mut(self, r: &mut Rules) -> &mut BTreeSet<String> {
         match self {
-            Group::Protocols => &mut r.protocols,
-            Group::Scopes => &mut r.scopes,
-            Group::Ifaces => &mut r.ifaces,
-            Group::Processes => &mut r.processes,
+            Self::Protocols => &mut r.protocols,
+            Self::Scopes => &mut r.scopes,
+            Self::Ifaces => &mut r.ifaces,
+            Self::Processes => &mut r.processes,
         }
     }
 }
@@ -62,23 +62,117 @@ fn choices(rows: &[Row]) -> Choices {
             .flatten()
             .map(|i| i.name.as_str())
             .collect();
-        ifaces.into_iter().for_each(|i| bump(&mut c.ifaces, i));
+        for i in ifaces {
+            bump(&mut c.ifaces, i);
+        }
         let procs: BTreeSet<&str> = [&r.sproc, &r.dproc]
             .into_iter()
             .flatten()
             .map(String::as_str)
             .collect();
-        procs.into_iter().for_each(|p| bump(&mut c.processes, p));
+        for p in procs {
+            bump(&mut c.processes, p);
+        }
     }
     c
 }
 
+/// Protocol chips by layer, with the show-only or hide mode.
+fn protocol_group(rules: RwSignal<Rules>, seen: Memo<Choices>) -> impl IntoView {
+    view! {
+        <fieldset class="filter-group">
+            <legend>"Protocols"</legend>
+            <div class="segmented" role="group" aria-label="Protocol mode">
+                <button
+                    type="button"
+                    class="chip chip-filter"
+                    aria-pressed=move || rules.with(|r| !r.exclude).to_string()
+                    on:click=move |_| rules.update(|r| r.exclude = false)
+                >
+                    "Show only selected"
+                </button>
+                <button
+                    type="button"
+                    class="chip chip-filter"
+                    aria-pressed=move || rules.with(|r| r.exclude).to_string()
+                    on:click=move |_| rules.update(|r| r.exclude = true)
+                >
+                    "Hide selected"
+                </button>
+            </div>
+            <p class="field-helper">"Application"</p>
+            {chips(rules, Group::Protocols, Signal::derive(move || seen.with(|s| s.apps.clone())), true)}
+            <p class="field-helper">"Transport"</p>
+            {chips(
+                rules,
+                Group::Protocols,
+                Signal::derive(move || seen.with(|s| s.transports.clone())),
+                false,
+            )}
+        </fieldset>
+    }
+}
+
+/// Port list and packet length bounds.
+fn limits_row(rules: RwSignal<Rules>) -> impl IntoView {
+    let num = |v: String| v.trim().parse::<u32>().ok();
+    let bad_ports = move || {
+        rules.with(|r| {
+            let parts = r.ports.split([',', ' ']).filter(|p| !p.is_empty()).count();
+            port_ranges(&r.ports).len() < parts
+        })
+    };
+    view! {
+        <div class="filter-row">
+            <label class="field">
+                <span class="field-label">"Ports"</span>
+                <input
+                    class="input"
+                    type="text"
+                    placeholder="443, 8000-8100"
+                    class:is-error=bad_ports
+                    prop:value=move || rules.with(|r| r.ports.clone())
+                    on:input=move |ev| rules.update(|r| r.ports = event_target_value(&ev))
+                />
+                <span class="field-helper">
+                    {move || {
+                        if bad_ports() {
+                            "Some parts are not ports or ranges; they are ignored."
+                        } else {
+                            "Source or destination port."
+                        }
+                    }}
+                </span>
+            </label>
+            <label class="field">
+                <span class="field-label">"Min length"</span>
+                <input
+                    class="input"
+                    type="number"
+                    min="0"
+                    prop:value=move || rules.with(|r| r.min_len.map_or_else(String::new, |n| n.to_string()))
+                    on:input=move |ev| rules.update(|r| r.min_len = num(event_target_value(&ev)))
+                />
+            </label>
+            <label class="field">
+                <span class="field-label">"Max length"</span>
+                <input
+                    class="input"
+                    type="number"
+                    min="0"
+                    prop:value=move || rules.with(|r| r.max_len.map_or_else(String::new, |n| n.to_string()))
+                    on:input=move |ev| rules.update(|r| r.max_len = num(event_target_value(&ev)))
+                />
+            </label>
+        </div>
+    }
+}
+
 /// "Filters" button with the number of active settings, and its dialog.
-#[component]
-pub fn FilterDialog(
+pub fn filter_dialog(
     rules: RwSignal<Rules>,
     rows: RwSignal<Vec<Row>>,
-    /// Table rows that pass every filter, and all packets.
+    // Table rows that pass every filter, and all packets.
     counts: Signal<(usize, usize)>,
 ) -> impl IntoView {
     let dialog = NodeRef::<html::Dialog>::new();
@@ -103,13 +197,6 @@ pub fn FilterDialog(
         }
     };
     let active = move || rules.with(Rules::active);
-    let num = |v: String| v.trim().parse::<u32>().ok();
-    let bad_ports = move || {
-        rules.with(|r| {
-            let parts = r.ports.split([',', ' ']).filter(|p| !p.is_empty()).count();
-            port_ranges(&r.ports).len() < parts
-        })
-    };
 
     view! {
         <button
@@ -144,36 +231,7 @@ pub fn FilterDialog(
                     </button>
                 </div>
 
-                <fieldset class="filter-group">
-                    <legend>"Protocols"</legend>
-                    <div class="segmented" role="group" aria-label="Protocol mode">
-                        <button
-                            type="button"
-                            class="chip chip-filter"
-                            aria-pressed=move || rules.with(|r| !r.exclude).to_string()
-                            on:click=move |_| rules.update(|r| r.exclude = false)
-                        >
-                            "Show only selected"
-                        </button>
-                        <button
-                            type="button"
-                            class="chip chip-filter"
-                            aria-pressed=move || rules.with(|r| r.exclude).to_string()
-                            on:click=move |_| rules.update(|r| r.exclude = true)
-                        >
-                            "Hide selected"
-                        </button>
-                    </div>
-                    <p class="field-helper">"Application"</p>
-                    {chips(rules, Group::Protocols, Signal::derive(move || seen.with(|s| s.apps.clone())), true)}
-                    <p class="field-helper">"Transport"</p>
-                    {chips(
-                        rules,
-                        Group::Protocols,
-                        Signal::derive(move || seen.with(|s| s.transports.clone())),
-                        false,
-                    )}
-                </fieldset>
+                {protocol_group(rules, seen)}
 
                 <fieldset class="filter-group">
                     <legend>"Address scope"</legend>
@@ -186,48 +244,7 @@ pub fn FilterDialog(
                     )}
                 </fieldset>
 
-                <div class="filter-row">
-                    <label class="field">
-                        <span class="field-label">"Ports"</span>
-                        <input
-                            class="input"
-                            type="text"
-                            placeholder="443, 8000-8100"
-                            class:is-error=bad_ports
-                            prop:value=move || rules.with(|r| r.ports.clone())
-                            on:input=move |ev| rules.update(|r| r.ports = event_target_value(&ev))
-                        />
-                        <span class="field-helper">
-                            {move || {
-                                if bad_ports() {
-                                    "Some parts are not ports or ranges; they are ignored."
-                                } else {
-                                    "Source or destination port."
-                                }
-                            }}
-                        </span>
-                    </label>
-                    <label class="field">
-                        <span class="field-label">"Min length"</span>
-                        <input
-                            class="input"
-                            type="number"
-                            min="0"
-                            prop:value=move || rules.with(|r| r.min_len.map(|n| n.to_string()).unwrap_or_default())
-                            on:input=move |ev| rules.update(|r| r.min_len = num(event_target_value(&ev)))
-                        />
-                    </label>
-                    <label class="field">
-                        <span class="field-label">"Max length"</span>
-                        <input
-                            class="input"
-                            type="number"
-                            min="0"
-                            prop:value=move || rules.with(|r| r.max_len.map(|n| n.to_string()).unwrap_or_default())
-                            on:input=move |ev| rules.update(|r| r.max_len = num(event_target_value(&ev)))
-                        />
-                    </label>
-                </div>
+                {limits_row(rules)}
 
                 <fieldset class="filter-group">
                     <legend>"Interfaces"</legend>

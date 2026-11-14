@@ -1,10 +1,11 @@
 //! Minimal privileged helper.
 //!
 //! The GUI runs it once at launch through pkexec, so it runs as root. It
-//! creates one unbound AF_PACKET socket and sends the descriptor to the GUI
-//! over stdout (which must be a Unix socket) with SCM_RIGHTS. The GUI binds
-//! that socket to an interface when the user starts a capture; bind needs
-//! no privilege.
+//! creates one `AF_PACKET` socket for all protocols, with a filter that
+//! drops every packet, and sends the descriptor to the GUI over stdout
+//! (which must be a Unix socket) with `SCM_RIGHTS`. The GUI replaces the
+//! filter with one that passes a single interface when the user starts a
+//! capture; that needs no privilege.
 //!
 //! It then stays to serve the few commands of `helper_proto` that HTTPS
 //! interception needs: firewall rules, trust store and marked sockets all
@@ -13,7 +14,7 @@
 //! Interception is undone on every way out:
 //! - the GUI closes the connection (it exits, crashes or is killed): the
 //!   helper removes the rules and the CA, then exits;
-//! - SIGTERM, SIGINT, SIGHUP or SIGQUIT to the helper: the same;
+//! - `SIGTERM`, `SIGINT`, `SIGHUP` or `SIGQUIT` to the helper: the same;
 //! - the helper itself is killed: the rules live in an owner-flagged nft
 //!   table held by an `nft -i` child, which exits when the helper's end of
 //!   its input closes, and the kernel then deletes the table. Only the
@@ -26,23 +27,32 @@
 #[path = "../helper_proto.rs"]
 mod proto;
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::mem;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::fs::{self, OpenOptions};
+use std::io::{self, BufRead, BufReader, IoSlice, Read, Write};
+use std::mem::MaybeUninit;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use socket2::{Domain, Socket, Type};
+use nix::sys::signal::{SigSet, Signal};
+use proto::{DROP_ALL, ETH_P_ALL};
+use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags, Shutdown};
+use socket2::{Domain, Protocol, Socket, Type};
 
 /// The `nft -i` process that owns the rules table, while interception is
 /// on. The lock also keeps `on` and `off` from running at the same time.
 static RULES: Mutex<Option<Child>> = Mutex::new(None);
 /// Signals that end the helper: cleanup runs first.
-const ENDING: [libc::c_int; 4] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT];
+const ENDING: [Signal; 4] = [
+    Signal::SIGTERM,
+    Signal::SIGINT,
+    Signal::SIGHUP,
+    Signal::SIGQUIT,
+];
 /// How long `nft -i` may take to create the table.
 const RULES_WAIT: Duration = Duration::from_secs(3);
 
@@ -65,39 +75,33 @@ const STORES: [(&str, &[&str], &str); 2] = [
 /// Longest command line.
 const LINE_MAX: u64 = 64;
 
-fn main() {
-    if let Err(e) = run() {
-        // Not eprintln: it panics when the GUI, which reads stderr, is gone.
-        let _ = writeln!(io::stderr(), "wireshark-capture: {e}");
-        std::process::exit(1);
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            // Not eprintln: it panics when the GUI, which reads stderr, is gone.
+            let _ = writeln!(io::stderr(), "wireshark-capture: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
-/// Runs cleanup and exits when an ending signal arrives. The signals are
+/// Ends the helper cleanly when an ending signal arrives. The signals are
 /// blocked in every thread and taken by one thread with sigwait, so the
-/// cleanup runs as normal code, not in a signal handler.
+/// cleanup runs as normal code, not in a signal handler. That thread
+/// cleans up, then shuts down the GUI connection: the command loop then
+/// sees its end, and `run` cleans up again and returns.
 fn watch_signals() -> io::Result<()> {
-    // SAFETY: sigset_t is a plain C struct; sigemptyset initializes it.
-    let mut set: libc::sigset_t = unsafe { mem::zeroed() };
-    // SAFETY: set is a valid sigset_t; the signal numbers are valid.
-    unsafe {
-        libc::sigemptyset(&raw mut set);
-        for s in ENDING {
-            libc::sigaddset(&raw mut set, s);
-        }
+    let mut set = SigSet::empty();
+    for s in ENDING {
+        set.add(s);
     }
-    // SAFETY: set is initialized; the old mask is not needed.
-    let err =
-        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut()) };
-    if err != 0 {
-        return Err(io::Error::from_raw_os_error(err));
-    }
+    set.thread_block()?;
     std::thread::spawn(move || {
-        let mut sig = 0;
-        // SAFETY: set and sig are valid for the call.
-        unsafe { libc::sigwait(&raw const set, &raw mut sig) };
-        let _ = off();
-        std::process::exit(128 + sig);
+        if set.wait().is_ok() {
+            let _ = off();
+            let _ = rustix::net::shutdown(io::stdout().as_fd(), Shutdown::Read);
+        }
     });
     Ok(())
 }
@@ -108,18 +112,14 @@ fn run() -> io::Result<()> {
             "usage: wireshark-capture (takes no arguments)",
         ));
     }
-    // Protocol 0: the socket receives nothing until the GUI binds it.
-    // SAFETY: plain syscall with constant arguments.
-    let raw = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-    if raw < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: raw is a new, valid file descriptor that nothing else owns.
-    let packet = unsafe { OwnedFd::from_raw_fd(raw) };
+    // Every protocol, but nothing gets through until the GUI replaces the
+    // filter with one for the interface it captures on.
+    let protocol = Protocol::from(i32::from(ETH_P_ALL.to_be()));
+    let packet = Socket::new(Domain::PACKET, Type::DGRAM, Some(protocol))?;
+    packet.attach_filter(&DROP_ALL)?;
     // Before any thread starts, so every thread inherits the blocked mask.
     watch_signals()?;
-    send(libc::STDOUT_FILENO, b"ok\n", Some(&packet))?;
-    drop(packet);
+    send(io::stdout().as_fd(), b"ok\n", Some(&packet.into()))?;
 
     // Leftovers of an earlier helper that was killed before it cleaned up.
     if let Err(e) = off() {
@@ -132,9 +132,10 @@ fn run() -> io::Result<()> {
 
 /// Answers commands until the GUI closes the connection.
 fn serve() -> io::Result<()> {
-    // SAFETY: stdout is the GUI's socket; nothing else in this process uses it.
-    let control = File::from(unsafe { OwnedFd::from_raw_fd(libc::STDOUT_FILENO) });
-    let fd = control.as_raw_fd();
+    // stdout is the GUI's socket; a duplicate keeps fd 1 open for the
+    // signal thread, which shuts the connection down through it.
+    let control = UnixStream::from(io::stdout().as_fd().try_clone_to_owned()?);
+    let output = control.try_clone()?;
     let mut input = BufReader::new(control);
     loop {
         let mut line = String::new();
@@ -154,7 +155,7 @@ fn serve() -> io::Result<()> {
             // One line: tool output may hold newlines.
             Err(e) => format!("error: {}\n", e.to_string().replace('\n', " ")),
         };
-        send(fd, reply.as_bytes(), socket.as_ref())?;
+        send(output.as_fd(), reply.as_bytes(), socket.as_ref())?;
     }
 }
 
@@ -241,10 +242,14 @@ fn hold_rules() -> io::Result<Child> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| io::Error::other(format!("{NFT}: {e}")))?;
-    let mut input = child.stdin.as_ref().expect("stdin is piped");
-    let sent = input
-        .write_all(rules.as_bytes())
-        .and_then(|()| input.flush());
+    let sent = child
+        .stdin
+        .as_ref()
+        .ok_or_else(|| io::Error::other("nft input is not piped"))
+        .and_then(|mut input: &ChildStdin| {
+            input.write_all(rules.as_bytes())?;
+            input.flush()
+        });
     let since = Instant::now();
     while sent.is_ok() && since.elapsed() < RULES_WAIT {
         if command(NFT, &["list", "table", proto::TABLE], None).is_ok() {
@@ -283,6 +288,7 @@ fn trust(pem: &str) -> io::Result<()> {
 
 /// Removes the rules, then the CA. Safe to call when nothing is set up.
 fn off() -> io::Result<()> {
+    // Held to the end, so `on` cannot start halfway through the cleanup.
     let mut held = RULES.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(mut child) = held.take() {
         // End of input ends `nft -i`, and the kernel drops its table.
@@ -294,11 +300,12 @@ fn off() -> io::Result<()> {
     let mut trust = Ok(());
     for (tool, args, file) in STORES {
         if Path::new(file).exists() {
-            trust = trust
-                .and(fs::remove_file(file))
-                .and(command(tool, args, None));
+            // Every store is tried, whatever an earlier one returned.
+            let removed = fs::remove_file(file).and_then(|()| command(tool, args, None));
+            trust = trust.and(removed);
         }
     }
+    drop(held);
     rules.and(trust)
 }
 
@@ -319,11 +326,10 @@ fn command(program: &str, args: &[&str], input: Option<&str>) -> io::Result<()> 
         .spawn()
         .map_err(|e| io::Error::other(format!("{program}: {e}")))?;
     if let Some(text) = input {
-        child
-            .stdin
-            .take()
-            .expect("stdin is piped")
-            .write_all(text.as_bytes())?;
+        let Some(mut stdin) = child.stdin.take() else {
+            return Err(io::Error::other(format!("{program}: input is not piped")));
+        };
+        stdin.write_all(text.as_bytes())?;
     }
     let out = child.wait_with_output()?;
     if out.status.success() {
@@ -337,45 +343,24 @@ fn command(program: &str, args: &[&str], input: Option<&str>) -> io::Result<()> 
     )))
 }
 
-/// Sends `payload`, with `fd` as SCM_RIGHTS ancillary data when given.
-fn send(sock: libc::c_int, payload: &[u8], fd: Option<&OwnedFd>) -> io::Result<()> {
-    let mut iov = libc::iovec {
-        iov_base: payload.as_ptr().cast_mut().cast(),
-        iov_len: payload.len(),
-    };
-    // u64 storage keeps the control buffer aligned for cmsghdr.
-    let mut control = [0u64; 4];
-    // SAFETY: CMSG_SPACE only computes a size.
-    let space = unsafe { libc::CMSG_SPACE(mem::size_of::<libc::c_int>() as u32) } as usize;
-    assert!(
-        space <= mem::size_of_val(&control),
-        "control buffer fits one fd"
-    );
-
-    // SAFETY: msghdr is a plain C struct; all-zero is a valid value.
-    let mut msg: libc::msghdr = unsafe { mem::zeroed() };
-    msg.msg_iov = &raw mut iov;
-    msg.msg_iovlen = 1;
-    if let Some(fd) = fd {
-        msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = space;
-        // SAFETY: msg points to a control buffer of `space` bytes, so the first
-        // header and its data area are inside the buffer.
-        unsafe {
-            let cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
-            (*cmsg).cmsg_level = libc::SOL_SOCKET;
-            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-            (*cmsg).cmsg_len = libc::CMSG_LEN(mem::size_of::<libc::c_int>() as u32) as usize;
-            libc::CMSG_DATA(cmsg)
-                .cast::<libc::c_int>()
-                .write_unaligned(fd.as_raw_fd());
-        }
+/// Sends `payload`, with `fd` as `SCM_RIGHTS` ancillary data when given.
+fn send(sock: impl AsFd, payload: &[u8], fd: Option<&OwnedFd>) -> io::Result<()> {
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = SendAncillaryBuffer::new(&mut space);
+    let fds = fd.map(AsFd::as_fd);
+    if let Some(fd) = &fds
+        && !control.push(SendAncillaryMessage::ScmRights(std::slice::from_ref(fd)))
+    {
+        return Err(io::Error::other("no room for the descriptor"));
     }
-    // SAFETY: msg and everything it points to stay valid during the call;
-    // the kernel only reads the payload.
-    let sent = unsafe { libc::sendmsg(sock, &raw const msg, libc::MSG_NOSIGNAL) };
-    if usize::try_from(sent).ok() != Some(payload.len()) {
-        return Err(io::Error::last_os_error());
+    let sent = rustix::net::sendmsg(
+        sock,
+        &[IoSlice::new(payload)],
+        &mut control,
+        SendFlags::NOSIGNAL,
+    )?;
+    if sent != payload.len() {
+        return Err(io::Error::other("reply cut short"));
     }
     Ok(())
 }
@@ -390,9 +375,9 @@ mod tests {
     fn pem_is_read_up_to_its_end_marker() {
         let text = format!("{PEM}off\n");
         let mut input = text.as_bytes();
-        assert_eq!(read_pem(&mut input).unwrap(), PEM);
+        assert_eq!(read_pem(&mut input).ok().as_deref(), Some(PEM));
         let mut rest = String::new();
-        input.read_line(&mut rest).unwrap();
+        assert_eq!(input.read_line(&mut rest).ok(), Some(4));
         assert_eq!(rest, "off\n");
     }
 

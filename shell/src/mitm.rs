@@ -140,7 +140,7 @@ pub struct Mitm {
     pub ca_pem: String,
 }
 
-/// Makes the TCP socket for a connection to a server: IPv6 when `true`.
+/// Makes the TCP socket for a connection to a server: `IPv6` when `true`.
 /// It must be marked so the redirect lets it through.
 pub type Connector = dyn Fn(bool) -> io::Result<OwnedFd> + Send + Sync;
 
@@ -162,7 +162,7 @@ struct Shared {
 }
 
 impl Mitm {
-    /// Listens on `PORT` of 127.0.0.1 and ::1, where the redirect delivers,
+    /// Listens on `PORT` of `127.0.0.1` and `::1`, where the redirect delivers,
     /// and writes the CA certificate next to the recordings. `emit` runs on
     /// a connection thread for each exchange.
     pub fn start(
@@ -235,12 +235,14 @@ fn accept_loop(listeners: &[TcpListener], shared: &Arc<Shared>) {
                     let shared = Arc::clone(shared);
                     std::thread::spawn(move || {
                         if let Err(e) = serve(stream, peer, conn, &shared) {
-                            eprintln!("mitm connection {conn}: {e}");
+                            let _ = writeln!(io::stderr(), "mitm connection {conn}: {e}");
                         }
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => eprintln!("mitm accept: {e}"),
+                Err(e) => {
+                    let _ = writeln!(io::stderr(), "mitm accept: {e}");
+                }
             }
         }
         if idle {
@@ -329,11 +331,11 @@ fn serve(stream: TcpStream, peer: SocketAddr, conn: u64, shared: &Shared) -> io:
             url: format!("tcp://{}", authority(&dst.ip().to_string(), dst.port(), 0)),
             ..base
         };
-        pass_through(stream, dst, &[], ex, true, shared)
+        pass_through(&stream, dst, &[], ex, true, shared)
     }
 }
 
-/// Reads the ClientHello, then decrypts with a certificate for its server
+/// Reads the `ClientHello`, then decrypts with a certificate for its server
 /// name, or passes the connection through untouched when the hello cannot
 /// be read or the program already rejected the CA.
 fn serve_tls(
@@ -368,7 +370,7 @@ fn serve_tls(
         Err(e) => {
             // TLS versions or extensions rustls does not take: relay as is.
             ex.note = Some(format!("not decrypted: unreadable TLS hello ({e})"));
-            return pass_through(stream, dst, &seen, ex, false, shared);
+            return pass_through(&stream, dst, &seen, ex, false, shared);
         }
     };
     let hello = accepted.client_hello();
@@ -377,8 +379,7 @@ fn serve_tls(
         .map_or_else(|| dst.ip().to_string(), str::to_owned);
     let offered: Vec<Vec<u8>> = hello
         .alpn()
-        .map(|list| list.map(<[u8]>::to_vec).collect())
-        .unwrap_or_default();
+        .map_or_else(Vec::new, |list| list.map(<[u8]>::to_vec).collect());
     ex.url = format!("tls://{}", authority(&host, dst.port(), 0));
     // The program, or the host when the program is unknown (another user's).
     let key = ex.app.clone().unwrap_or_else(|| host.clone());
@@ -391,7 +392,7 @@ fn serve_tls(
         ex.note = Some(format!(
             "not decrypted: {key} rejected the interception certificate earlier"
         ));
-        return pass_through(stream, dst, &seen, ex, false, shared);
+        return pass_through(&stream, dst, &seen, ex, false, shared);
     }
 
     // HTTP/1.1 alone when the client takes it, since its messages are the
@@ -404,11 +405,11 @@ fn serve_tls(
         offered
     };
     let server = connect_tls(dst, &host, alpn, shared);
-    let chosen = match &server {
-        Ok(s) => s.get_ref().conn.alpn_protocol().map(<[u8]>::to_vec),
+    let chosen = server.as_ref().map_or_else(
         // The client then gets a 502 over HTTP/1.1, or a closed connection.
-        Err(_) => wants_http1.then(|| HTTP1.to_vec()),
-    };
+        |_| wants_http1.then(|| HTTP1.to_vec()),
+        |s| s.get_ref().conn.alpn_protocol().map(<[u8]>::to_vec),
+    );
     let mut config = (*shared.host_config(&host)?).clone();
     config.alpn_protocols = chosen.iter().cloned().collect();
     let conn = match accepted.into_connection(Arc::new(config)) {
@@ -418,7 +419,7 @@ fn serve_tls(
             // a hello rustls will not (old versions or ciphers).
             drop(server);
             ex.note = Some(format!("not decrypted: {e}"));
-            return pass_through(stream, dst, &seen, ex, false, shared);
+            return pass_through(&stream, dst, &seen, ex, false, shared);
         }
     };
     let mut tls = StreamOwned::new(conn, stream);
@@ -439,11 +440,38 @@ fn serve_tls(
             return Ok(());
         }
     }
+    let decrypted = Decrypted {
+        dst,
+        host: &host,
+        chosen,
+    };
+    relay_decrypted(tls, server, &decrypted, ex, shared)
+}
+
+/// A TLS connection whose handshake with the client is done.
+struct Decrypted<'a> {
+    dst: SocketAddr,
+    /// The server name the client asked for.
+    host: &'a str,
+    /// The protocol agreed with the client through ALPN.
+    chosen: Option<Vec<u8>>,
+}
+
+/// Relays a decrypted connection: as HTTP exchanges when it carries
+/// HTTP/1.1, else as one record of the bytes each way.
+fn relay_decrypted(
+    tls: StreamOwned<ServerConnection, TcpStream>,
+    server: io::Result<BufReader<StreamOwned<ClientConnection, TcpStream>>>,
+    conn: &Decrypted<'_>,
+    mut ex: Exchange,
+    shared: &Shared,
+) -> io::Result<()> {
+    let Decrypted { dst, host, chosen } = conn;
     let http = chosen.as_deref() == Some(HTTP1) || (chosen.is_none() && is_web_port(dst.port()));
     if http {
         let target = Target {
             scheme: "https",
-            authority: authority(&host, dst.port(), 443),
+            authority: authority(host, dst.port(), 443),
         };
         return exchanges(
             BufReader::new(tls),
@@ -462,7 +490,7 @@ fn serve_tls(
             return Ok(());
         }
     };
-    if let Some(p) = &chosen {
+    if let Some(p) = chosen {
         ex.note = Some(format!("decrypted, {}", String::from_utf8_lossy(p)));
     }
     let mut client = BufReader::new(tls);
@@ -483,14 +511,68 @@ fn serve_tls(
         open: true,
         ..ex.clone()
     });
-    let result = tunnel(
-        &mut client,
-        &mut server,
-        (&mut ex.req_body, &mut ex.resp_body),
-        true,
+    let mut bodies = (
+        std::mem::take(&mut ex.req_body),
+        std::mem::take(&mut ex.resp_body),
     );
+    let result = tunnel(&mut client, &mut server, &mut bodies, true);
+    (ex.req_body, ex.resp_body) = bodies;
     shared.emit_end(id, ex, started);
     result
+}
+
+/// Answers the client's first request with a 502 that says why the server
+/// cannot be reached, and records it. `first` is a request head already read.
+fn unreachable_server<C: Sock>(
+    client: &mut BufReader<C>,
+    first: Option<Vec<u8>>,
+    target: &Target,
+    mut ex: Exchange,
+    why: &io::Error,
+    shared: &Shared,
+) -> io::Result<()> {
+    let head = match first {
+        Some(h) => Some(h),
+        None => read_head(client)?,
+    };
+    if let Some(req) = head.as_deref().map(parse_request).transpose()? {
+        ex.method = req.method;
+        ex.url = url(target, &req.target);
+        ex.req_headers = req.headers;
+    }
+    let text = format!("cannot reach {}: {why}", target.authority);
+    ex.error = Some(text.clone());
+    ex.id = shared.ids.fetch_add(1, Ordering::Relaxed) + 1;
+    ex.at_ms = now_ms();
+    (shared.emit)(ex);
+    client.get_mut().write_all(bad_gateway(&text).as_bytes())
+}
+
+/// Reads the server's response head, passing interim 1xx responses on to
+/// the client. `None`, with `ex.error` set, when no response came.
+fn read_response<C: Sock, S: Sock>(
+    server: &mut BufReader<S>,
+    client: &mut BufReader<C>,
+    ex: &mut Exchange,
+) -> io::Result<Option<Response>> {
+    loop {
+        let head = match read_head(server) {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                ex.error = Some("the server closed the connection".to_owned());
+                return Ok(None);
+            }
+            Err(e) => {
+                ex.error = Some(format!("no response from the server: {e}"));
+                return Ok(None);
+            }
+        };
+        client.get_mut().write_all(&head)?;
+        let resp = parse_response(&head)?;
+        if !(100..200).contains(&resp.status) || resp.status == 101 {
+            return Ok(Some(resp));
+        }
+    }
 }
 
 /// The fields of a TLS connection's record that its HTTP exchanges share.
@@ -504,7 +586,7 @@ fn ex_base(ex: Exchange) -> Exchange {
 }
 
 /// Ports where a TLS client without ALPN speaks HTTP.
-fn is_web_port(port: u16) -> bool {
+const fn is_web_port(port: u16) -> bool {
     matches!(port, 443 | 4443 | 8443)
 }
 
@@ -541,7 +623,7 @@ impl Read for Tee<'_> {
 /// sending `seen` (client bytes already read). `keep` records the first
 /// bytes of each direction; it is off for ciphertext.
 fn pass_through(
-    client: TcpStream,
+    client: &TcpStream,
     dst: SocketAddr,
     seen: &[u8],
     mut ex: Exchange,
@@ -578,10 +660,10 @@ fn pass_through(
         linger(&last_up, || down_done_up.load(Ordering::Relaxed), &s);
         up
     });
-    copy(&server, &client, &mut ex.resp_body, keep, &last);
+    copy(&server, client, &mut ex.resp_body, keep, &last);
     down_done.store(true, Ordering::Relaxed);
     // The server is done; a client that stays silent is closed after LINGER.
-    linger(&last, || upward.is_finished(), &client);
+    linger(&last, || upward.is_finished(), client);
     ex.req_body = upward.join().unwrap_or_default();
     shared.emit_end(id, ex, started);
     Ok(())
@@ -678,9 +760,10 @@ impl Shared {
 
     /// Server configuration with a certificate for `host`, made once per host.
     fn host_config(&self, host: &str) -> io::Result<Arc<ServerConfig>> {
-        let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(c) = hosts.get(host) {
-            return Ok(Arc::clone(c));
+        let hosts = || self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
+        let cached = hosts().get(host).cloned();
+        if let Some(c) = cached {
+            return Ok(c);
         }
         let key = KeyPair::generate().map_err(io::Error::other)?;
         let mut params = CertificateParams::new(vec![host.to_owned()]).map_err(io::Error::other)?;
@@ -703,9 +786,13 @@ impl Shared {
             .with_single_cert(chain, key)
             .map_err(io::Error::other)?;
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let config = Arc::new(config);
-        hosts.insert(host.to_owned(), Arc::clone(&config));
-        Ok(config)
+        // Two connections may make one at the same time: the first one kept wins.
+        let kept = Arc::clone(
+            hosts()
+                .entry(host.to_owned())
+                .or_insert_with(|| Arc::new(config)),
+        );
+        Ok(kept)
     }
 }
 
@@ -775,25 +862,7 @@ fn exchanges<C: Sock, S: Sock>(
 ) -> io::Result<()> {
     let mut server = match server {
         Ok(s) => s,
-        Err(e) => {
-            // Answer the client's first request with the reason.
-            let head = match first.take() {
-                Some(h) => Some(h),
-                None => read_head(&mut client)?,
-            };
-            let mut ex = base;
-            if let Some(req) = head.as_deref().map(parse_request).transpose()? {
-                ex.method = req.method;
-                ex.url = url(target, &req.target);
-                ex.req_headers = req.headers;
-            }
-            ex.error = Some(format!("cannot reach {}: {e}", target.authority));
-            ex.id = shared.ids.fetch_add(1, Ordering::Relaxed) + 1;
-            ex.at_ms = now_ms();
-            let text = ex.error.clone().unwrap_or_default();
-            (shared.emit)(ex);
-            return client.get_mut().write_all(bad_gateway(&text).as_bytes());
-        }
+        Err(e) => return unreachable_server(&mut client, first, target, base, &e, shared),
     };
     let local = server
         .get_ref()
@@ -807,7 +876,7 @@ fn exchanges<C: Sock, S: Sock>(
         .peer_addr()
         .ok()
         .map(|a| a.to_string());
-    let mut served = 0;
+    let mut requests = 0;
     while !shared.stop.load(Ordering::Relaxed) {
         let head = match first
             .take()
@@ -816,7 +885,7 @@ fn exchanges<C: Sock, S: Sock>(
             Ok(Some(h)) => h,
             Ok(None) => break,
             // The TLS handshake with the client runs on this first read.
-            Err(e) if served == 0 && target.scheme == "https" => {
+            Err(e) if requests == 0 && target.scheme == "https" => {
                 (shared.emit)(Exchange {
                     id: shared.ids.fetch_add(1, Ordering::Relaxed) + 1,
                     at_ms: now_ms(),
@@ -833,7 +902,7 @@ fn exchanges<C: Sock, S: Sock>(
             }
             Err(e) => return Err(e),
         };
-        served += 1;
+        requests += 1;
         let started = Instant::now();
         let req = parse_request(&head)?;
         let mut ex = Exchange {
@@ -851,26 +920,7 @@ fn exchanges<C: Sock, S: Sock>(
         ex.req_body = copy_body(&mut client, server.get_mut(), req_framing, &req.headers)?;
         server.get_mut().flush()?;
 
-        // Interim 1xx responses go to the client as they come.
-        let resp = loop {
-            let head = match read_head(&mut server) {
-                Ok(Some(h)) => h,
-                Ok(None) => {
-                    ex.error = Some("the server closed the connection".to_owned());
-                    break None;
-                }
-                Err(e) => {
-                    ex.error = Some(format!("no response from the server: {e}"));
-                    break None;
-                }
-            };
-            client.get_mut().write_all(&head)?;
-            let resp = parse_response(&head)?;
-            if !(100..200).contains(&resp.status) || resp.status == 101 {
-                break Some(resp);
-            }
-        };
-        let Some(resp) = resp else {
+        let Some(resp) = read_response(&mut server, &mut client, &mut ex)? else {
             ex.ms = elapsed_ms(started);
             let text = ex.error.clone().unwrap_or_default();
             (shared.emit)(ex);
@@ -894,8 +944,8 @@ fn exchanges<C: Sock, S: Sock>(
         (shared.emit)(ex);
         if resp.status == 101 {
             // An upgraded protocol (WebSocket) is relayed without parsing.
-            let (mut up, mut down) = (Body::default(), Body::default());
-            return tunnel(&mut client, &mut server, (&mut up, &mut down), false);
+            let mut bodies = (Body::default(), Body::default());
+            return tunnel(&mut client, &mut server, &mut bodies, false);
         }
         let close = |h: &[(String, String)]| {
             header(h, "connection").is_some_and(|v| v.eq_ignore_ascii_case("close"))
@@ -921,7 +971,7 @@ fn bad_gateway(text: &str) -> String {
 fn tunnel<C: Sock, S: Sock>(
     a: &mut BufReader<C>,
     b: &mut BufReader<S>,
-    bodies: (&mut Body, &mut Body),
+    bodies: &mut (Body, Body),
     keep: bool,
 ) -> io::Result<()> {
     a.get_ref().tcp().set_read_timeout(Some(POLL))?;
@@ -929,8 +979,8 @@ fn tunnel<C: Sock, S: Sock>(
     let mut idle = Duration::ZERO;
     while idle < IDLE {
         match (
-            pump(a, b.get_mut(), bodies.0, keep)?,
-            pump(b, a.get_mut(), bodies.1, keep)?,
+            pump(a, b.get_mut(), &mut bodies.0, keep)?,
+            pump(b, a.get_mut(), &mut bodies.1, keep)?,
         ) {
             (None, _) | (_, None) => break,
             (Some(0), Some(0)) => idle += POLL * 2,
@@ -1197,7 +1247,7 @@ fn parse_response(head: &[u8]) -> io::Result<Response> {
     })
 }
 
-fn pairs(fields: &[httparse::Header]) -> Vec<(String, String)> {
+fn pairs(fields: &[httparse::Header<'_>]) -> Vec<(String, String)> {
     fields
         .iter()
         .map(|h| {
@@ -1233,7 +1283,7 @@ fn url(target: &Target, path: &str) -> String {
     }
 }
 
-/// `host` or `host:port` as a URL names it: IPv6 in brackets, the port
+/// `host` or `host:port` as a URL names it: `IPv6` in brackets, the port
 /// only when it is not the scheme's default.
 fn authority(host: &str, port: u16, default: u16) -> String {
     let host = match host.parse::<IpAddr>() {
@@ -1261,9 +1311,17 @@ fn elapsed_ms(since: Instant) -> u64 {
 mod tests {
     use super::*;
 
+    /// The body `copy_body` records and the bytes it forwards. A failure
+    /// shows as the body's note.
     fn body(wire: &[u8], framing: Framing, headers: &[(String, String)]) -> (Body, Vec<u8>) {
         let mut out = Vec::new();
-        let b = copy_body(&mut BufReader::new(wire), &mut out, framing, headers).unwrap();
+        let b =
+            copy_body(&mut BufReader::new(wire), &mut out, framing, headers).unwrap_or_else(|e| {
+                Body {
+                    note: Some(format!("copy failed: {e}")),
+                    ..Body::default()
+                }
+            });
         (b, out)
     }
 
@@ -1294,8 +1352,11 @@ mod tests {
     fn gzip_body_is_decoded() {
         use flate2::{Compression, write::GzEncoder};
         let mut z = GzEncoder::new(Vec::new(), Compression::default());
-        z.write_all(b"hello").unwrap();
-        let gz = z.finish().unwrap();
+        // A failed encoding leaves `gz` empty, which fails the check below.
+        let gz = z
+            .write_all(b"hello")
+            .and_then(|()| z.finish())
+            .unwrap_or_default();
         let headers = [("Content-Encoding".to_owned(), "gzip".to_owned())];
         let (b, out) = body(&gz, Framing::Length(gz.len() as u64), &headers);
         assert_eq!((out, b.data.as_slice()), (gz, &b"hello"[..]));
@@ -1303,45 +1364,49 @@ mod tests {
 
     /// Loads the helper's rules the way the helper does: the owner-flagged
     /// table lives as long as the returned `nft -i`.
-    fn hold_rules() -> std::process::Child {
+    fn hold_rules() -> io::Result<std::process::Child> {
         let child = std::process::Command::new("nft")
             .arg("-i")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let mut input = child.stdin.as_ref().unwrap();
-        input
-            .write_all(crate::helper_proto::rules().as_bytes())
-            .unwrap();
+            .spawn()?;
+        let Some(mut input) = child.stdin.as_ref() else {
+            return Err(io::Error::other("nft input is not piped"));
+        };
+        input.write_all(crate::helper_proto::rules().as_bytes())?;
         std::thread::sleep(Duration::from_millis(500));
-        child
+        Ok(child)
     }
 
-    /// Ends `nft -i` and checks the kernel dropped its table.
-    fn drop_rules(mut child: std::process::Child) {
+    /// Ends `nft -i` and returns the tables left after it.
+    fn drop_rules(mut child: std::process::Child) -> io::Result<String> {
         drop(child.stdin.take());
-        child.wait().unwrap();
+        child.wait()?;
         let out = std::process::Command::new("nft")
             .args(["list", "tables"])
-            .output()
-            .unwrap();
-        assert!(
-            !String::from_utf8_lossy(&out.stdout).contains("wireshark_rs"),
-            "the table goes with its owner"
-        );
+            .output()?;
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
-    /// Installs the helper's redirect rules, runs a plain curl (no proxy
-    /// option) to `MITM_URL` (default `https://example.com/`) and prints
-    /// what the proxy recorded. Then checks a protocol where the server
-    /// speaks first (SSH to `MITM_SSH`, default github.com:22) still works.
-    /// Needs root in a network namespace, e.g.
-    /// `pasta --config-net -- cargo test ... live_proxy -- --ignored`.
-    #[test]
-    #[ignore = "network and a root network namespace"]
-    fn live_proxy() {
-        let url = std::env::var("MITM_URL").unwrap_or_else(|_| "https://example.com/".into());
+    /// What the live run saw.
+    #[derive(Debug)]
+    struct Live {
+        /// curl with the CA, through the proxy.
+        trusting: std::process::Output,
+        /// Two curls without the CA, one after the other.
+        untrusting: [std::process::Output; 2],
+        /// The first bytes the SSH server sent through the redirect.
+        banner: Result<[u8; 4], String>,
+        /// nft tables after the rules' owner ended.
+        tables: String,
+        /// What the proxy recorded.
+        seen: Vec<Exchange>,
+        /// Whether the CA file outlived the proxy.
+        ca_kept: bool,
+    }
+
+    /// Runs the proxy and the redirect against `url` and `ssh`.
+    fn run_live(url: &str, ssh: &str) -> io::Result<Live> {
         let (tx, rx) = std::sync::mpsc::channel();
         let tx = Mutex::new(tx);
         let connector: Arc<Connector> = Arc::new(|v6| {
@@ -1354,36 +1419,80 @@ mod tests {
             s.set_mark(crate::helper_proto::MARK)?;
             Ok(s.into())
         });
-        let mitm = Mitm::start(connector, move |ex| drop(tx.lock().unwrap().send(ex))).unwrap();
-        let rules = hold_rules();
-        let out = std::process::Command::new("curl")
+        let mitm = Mitm::start(connector, move |ex| {
+            if let Ok(tx) = tx.lock() {
+                let _ = tx.send(ex);
+            }
+        })?;
+        let rules = hold_rules()?;
+        let trusting = std::process::Command::new("curl")
             .args(["-sS", "--compressed", "--cacert"])
             .arg(&mitm.ca_path)
-            .arg(&url)
-            .output()
-            .unwrap();
-        // The namespace's trust store lacks the CA, as Firefox's does: the
-        // first try fails, later ones pass through undecrypted.
+            .arg(url)
+            .output()?;
         let untrusting = || {
             std::process::Command::new("curl")
                 .args(["-sS", "-o", "/dev/null", "-w", "%{http_code}"])
-                .arg(&url)
+                .arg(url)
                 .output()
-                .unwrap()
         };
-        let (first, second) = (untrusting(), untrusting());
-        let ssh = std::env::var("MITM_SSH").unwrap_or_else(|_| "github.com:22".into());
+        let untrusting = [untrusting()?, untrusting()?];
         let mut banner = [0u8; 4];
-        let greeted = std::net::TcpStream::connect(&ssh).and_then(|mut s| {
-            s.set_read_timeout(Some(Duration::from_secs(10)))?;
-            s.read_exact(&mut banner)
-        });
-        drop_rules(rules);
+        let banner = std::net::TcpStream::connect(ssh)
+            .and_then(|mut s| {
+                s.set_read_timeout(Some(Duration::from_secs(10)))?;
+                s.read_exact(&mut banner)
+            })
+            .map(|()| banner)
+            .map_err(|e| e.to_string());
+        let tables = drop_rules(rules)?;
+        let mut seen = Vec::new();
+        while let Ok(ex) = rx.recv_timeout(Duration::from_secs(5)) {
+            seen.push(ex);
+        }
+        let ca = mitm.ca_path.clone();
+        drop(mitm);
+        Ok(Live {
+            trusting,
+            untrusting,
+            banner,
+            tables,
+            seen,
+            ca_kept: ca.exists(),
+        })
+    }
+
+    /// Installs the helper's redirect rules, runs a plain curl (no proxy
+    /// option) to `MITM_URL` (default `https://example.com/`) and prints
+    /// what the proxy recorded. Then checks a protocol where the server
+    /// speaks first (SSH to `MITM_SSH`, default github.com:22) still works.
+    /// Needs root in a network namespace, e.g.
+    /// `pasta --config-net -- cargo test ... live_proxy -- --ignored`.
+    #[test]
+    #[ignore = "network and a root network namespace"]
+    fn live_proxy() {
+        let url = std::env::var("MITM_URL").unwrap_or_else(|_| "https://example.com/".into());
+        let ssh = std::env::var("MITM_SSH").unwrap_or_else(|_| "github.com:22".into());
+        let live = run_live(&url, &ssh);
+        assert!(live.is_ok(), "{live:?}");
+        let Ok(live) = live else { return };
+        let mut log = io::stderr();
+        for ex in &live.seen {
+            let _ = writeln!(
+                log,
+                "{} {} -> {:?} open={} app={:?} note={:?} error={:?} body {} B",
+                ex.method, ex.url, ex.status, ex.open, ex.app, ex.note, ex.error, ex.resp_body.size
+            );
+        }
+        let stderr = |out: &std::process::Output| String::from_utf8_lossy(&out.stderr).into_owned();
         assert!(
-            out.status.success(),
+            live.trusting.status.success(),
             "curl: {}",
-            String::from_utf8_lossy(&out.stderr)
+            stderr(&live.trusting)
         );
+        // The namespace's trust store lacks the CA, as Firefox's does: the
+        // first try fails, later ones pass through undecrypted.
+        let [first, second] = &live.untrusting;
         assert!(
             !first.status.success(),
             "a client without the CA fails once"
@@ -1392,66 +1501,56 @@ mod tests {
             (second.status.success(), &second.stdout[..]),
             (true, &b"200"[..]),
             "then passes through: {}",
-            String::from_utf8_lossy(&second.stderr)
+            stderr(second)
         );
-        greeted.unwrap();
-        assert_eq!(&banner, b"SSH-", "the server greeting passes through");
-        let mut seen: Vec<Exchange> = Vec::new();
-        while let Ok(ex) = rx.recv_timeout(Duration::from_secs(5)) {
-            seen.push(ex);
-        }
-        for ex in &seen {
-            println!(
-                "{} {} open={} app={:?} note={:?} error={:?}",
-                ex.method, ex.url, ex.open, ex.app, ex.note, ex.error
-            );
-        }
-        let raw = seen
-            .iter()
-            .find(|e| e.method == "TCP" && !e.open)
-            .expect("the SSH connection is recorded");
-        assert!(raw.resp_body.data.starts_with(b"SSH-"));
-        let ex = seen
-            .into_iter()
-            .find(|e| e.status.is_some())
-            .expect("an HTTP exchange");
-        println!(
-            "{} {} -> {:?} {} | body {} B ({:?}) | server {:?} via {:?}\n{}",
-            ex.method,
-            ex.url,
-            ex.status,
-            ex.reason,
-            ex.resp_body.size,
-            ex.resp_body.note,
-            ex.remote,
-            ex.local,
-            String::from_utf8_lossy(&ex.resp_body.data)
-                .chars()
-                .take(200)
-                .collect::<String>(),
-        );
-        assert_eq!(ex.status, Some(200));
         assert_eq!(
-            ex.resp_body.data, out.stdout,
+            live.banner,
+            Ok(*b"SSH-"),
+            "the server greeting passes through"
+        );
+        assert!(
+            live.seen
+                .iter()
+                .any(|e| e.method == "TCP" && !e.open && e.resp_body.data.starts_with(b"SSH-")),
+            "the SSH connection is recorded"
+        );
+        let http = live.seen.iter().find(|e| e.status.is_some());
+        assert_eq!(
+            http.map(|e| (e.status, &e.resp_body.data)),
+            Some((Some(200), &live.trusting.stdout)),
             "the proxy shows what curl got"
         );
-        let ca = mitm.ca_path.clone();
-        drop(mitm);
-        assert!(!ca.exists(), "the CA file is deleted when the proxy stops");
+        assert!(
+            !live.tables.contains("wireshark_rs"),
+            "the table goes with its owner"
+        );
+        assert!(!live.ca_kept, "the CA file is deleted when the proxy stops");
     }
 
     #[test]
     fn heads_targets_and_framing() {
         let mut r = BufReader::new(&b"\r\nGET /x?y HTTP/1.1\r\nHost: a.test\r\n\r\nrest"[..]);
-        let head = read_head(&mut r).unwrap().unwrap();
-        assert_eq!(head, b"GET /x?y HTTP/1.1\r\nHost: a.test\r\n\r\n");
-        let req = parse_request(&head).unwrap();
-        assert_eq!((req.method.as_str(), req.target.as_str()), ("GET", "/x?y"));
-        assert_eq!(header(&req.headers, "HOST"), Some("a.test"));
-        assert_eq!(framing(&req.headers, true), Framing::Length(0));
+        let head = read_head(&mut r).ok().flatten();
+        assert_eq!(
+            head.as_deref(),
+            Some(&b"GET /x?y HTTP/1.1\r\nHost: a.test\r\n\r\n"[..])
+        );
+        let req = head.as_deref().and_then(|h| parse_request(h).ok());
+        assert_eq!(
+            req.as_ref().map(|r| (r.method.as_str(), r.target.as_str())),
+            Some(("GET", "/x?y"))
+        );
+        assert_eq!(
+            req.as_ref().and_then(|r| header(&r.headers, "HOST")),
+            Some("a.test")
+        );
+        assert_eq!(
+            req.as_ref().map(|r| framing(&r.headers, true)),
+            Some(Framing::Length(0))
+        );
         assert_eq!(framing(&[], false), Framing::UntilClose);
         assert_eq!(authority("example.com", 443, 443), "example.com");
         assert_eq!(authority("2001:db8::1", 8443, 443), "[2001:db8::1]:8443");
-        assert!(read_head(&mut BufReader::new(&b""[..])).unwrap().is_none());
+        assert!(matches!(read_head(&mut BufReader::new(&b""[..])), Ok(None)));
     }
 }

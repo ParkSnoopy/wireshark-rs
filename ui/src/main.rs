@@ -17,16 +17,16 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use wasm_bindgen::prelude::*;
 
-use filters::FilterDialog;
-use graph::GraphPage;
-use inspector::{ExchangeView, Inspector};
+use filters::filter_dialog;
+use graph::graph_page;
+use inspector::{exchange_view, inspector};
 use model::{
     Col, DomainInfo, Domains, Exchange, Filter, Graph, Hosts, Inspection, MitmState, Ptrs, Row,
     Rules, TableView, table_view,
 };
-use networks::NetworksPage;
-use packets::PacketTable;
-use select::Select;
+use networks::networks_page;
+use packets::packet_table;
+use select::select;
 
 /// Outcome of a save, from the shell.
 #[derive(Clone, Deserialize)]
@@ -37,7 +37,7 @@ struct Notice {
 
 /// How long a notice stays, in milliseconds.
 const NOTICE_MS: u64 = 6000;
-/// Decrypted requests kept; each holds up to 128 KiB of bodies.
+/// Decrypted requests kept; each holds up to 128 kibibytes of bodies.
 const EXCHANGES_MAX: usize = 500;
 
 /// `state` is `pending`, `idle`, `capturing`, `stopped` or `error`.
@@ -57,14 +57,14 @@ enum Tab {
 }
 
 impl Tab {
-    const ALL: [Tab; 4] = [Tab::Packets, Tab::Graph, Tab::Networks, Tab::Https];
+    const ALL: [Self; 4] = [Self::Packets, Self::Graph, Self::Networks, Self::Https];
 
-    fn id(self) -> &'static str {
+    const fn id(self) -> &'static str {
         match self {
-            Tab::Packets => "tab-packets",
-            Tab::Graph => "tab-graph",
-            Tab::Networks => "tab-networks",
-            Tab::Https => "tab-https",
+            Self::Packets => "tab-packets",
+            Self::Graph => "tab-graph",
+            Self::Networks => "tab-networks",
+            Self::Https => "tab-https",
         }
     }
 }
@@ -80,7 +80,7 @@ extern "C" {
 }
 
 fn main() {
-    leptos::mount::mount_to_body(App);
+    leptos::mount::mount_to_body(app);
 }
 
 /// Reads the JSON string the shell puts in `CustomEvent.detail`.
@@ -92,56 +92,148 @@ fn detail<T: DeserializeOwned>(ev: web_sys::Event) -> Option<T> {
     serde_json::from_str(&text).ok()
 }
 
-#[component]
-fn App() -> impl IntoView {
-    let ifaces = interfaces();
-    let iface = RwSignal::new(ifaces.first().cloned().unwrap_or_default());
-    let rows = RwSignal::new(Vec::<Row>::new());
-    let graph = RwSignal::new(Graph::default());
-    let hosts = RwSignal::new(Hosts::default());
-    // Domain data outlives a capture: it describes the domain, not the traffic.
-    let domains = RwSignal::new(Domains::new());
-    // PTR names, and whether to look them up for every address seen.
-    let ptrs = RwSignal::new(Ptrs::new());
-    let ptr_on = RwSignal::new(true);
-    // On by default: under load, repeats of one flow fill the table.
-    let collapse = RwSignal::new(true);
-    let recent_only = RwSignal::new(false);
-    let notice = RwSignal::new(None::<Notice>);
-    let status = RwSignal::new(Status {
-        state: "pending".to_owned(),
-        text: "waiting for capture permission".to_owned(),
-    });
-    let tab = RwSignal::new(Tab::Packets);
-    let query = RwSignal::new(String::new());
-    let rules = RwSignal::new(Rules::default());
-    // Newest first: new packets enter at the top, the oldest end up at the bottom.
-    let sort = RwSignal::new((Col::No, true));
-    // Clicked row (index into `rows`) and its detail from the shell.
-    let selected = RwSignal::new(None::<usize>);
-    let inspection = RwSignal::new(None::<Inspection>);
-    // HTTPS proxy state and what it decrypted, newest last.
-    let mitm = RwSignal::new(MitmState::default());
-    let exchanges = RwSignal::new(Vec::<Exchange>::new());
+/// Copyable handles to the window's state.
+#[derive(Clone, Copy)]
+struct App {
+    iface: RwSignal<String>,
+    rows: RwSignal<Vec<Row>>,
+    graph: RwSignal<Graph>,
+    hosts: RwSignal<Hosts>,
+    /// Domain data outlives a capture: it describes the domain, not the traffic.
+    domains: RwSignal<Domains>,
+    /// PTR names, and whether to look them up for every address seen.
+    ptrs: RwSignal<Ptrs>,
+    ptr_on: RwSignal<bool>,
+    collapse: RwSignal<bool>,
+    recent_only: RwSignal<bool>,
+    notice: RwSignal<Option<Notice>>,
+    status: RwSignal<Status>,
+    tab: RwSignal<Tab>,
+    query: RwSignal<String>,
+    rules: RwSignal<Rules>,
+    sort: RwSignal<(Col, bool)>,
+    /// Clicked row (index into `rows`) and its detail from the shell.
+    selected: RwSignal<Option<usize>>,
+    inspection: RwSignal<Option<Inspection>>,
+    /// HTTPS proxy state and what it decrypted, newest last.
+    mitm: RwSignal<MitmState>,
+    exchanges: RwSignal<Vec<Exchange>>,
+    /// A capture is starting or running.
+    busy: Signal<bool>,
+    filter: Memo<Filter>,
+    /// Rows the table shows.
+    table: Memo<TableView>,
+    /// Number of domains registered or transferred recently.
+    flagged_names: Memo<usize>,
+}
 
-    let busy = Signal::derive(move || {
-        status.with(|s| matches!(s.state.as_str(), "pending" | "capturing"))
-    });
-    let seen = move || rows.with(|r| r.last().map_or(0, |r| r.no));
-    let filter = Memo::new(move |_| rules.with(|r| Filter::new(&query.get(), r)));
-    let view = Memo::new(move |_| -> TableView {
-        let f = filter.get();
-        let recent = recent_only.get();
-        domains.with(|d| {
-            rows.with(|r| {
-                let keep = |row: &Row| f.matches(row) && (!recent || row.domain_flag(d).is_some());
-                table_view(r, keep, collapse.get(), sort.get())
+impl App {
+    fn new(iface: String) -> Self {
+        let rows = RwSignal::new(Vec::<Row>::new());
+        let domains = RwSignal::new(Domains::new());
+        let status = RwSignal::new(Status {
+            state: "pending".to_owned(),
+            text: "waiting for capture permission".to_owned(),
+        });
+        let query = RwSignal::new(String::new());
+        let rules = RwSignal::new(Rules::default());
+        // On by default: under load, repeats of one flow fill the table.
+        let collapse = RwSignal::new(true);
+        let recent_only = RwSignal::new(false);
+        // Newest first: new packets enter at the top, the oldest end up at the bottom.
+        let sort = RwSignal::new((Col::No, true));
+        let filter = Memo::new(move |_| rules.with(|r| Filter::new(&query.get(), r)));
+        let table = Memo::new(move |_| -> TableView {
+            let f = filter.get();
+            let recent = recent_only.get();
+            domains.with(|d| {
+                rows.with(|r| {
+                    let keep =
+                        |row: &Row| f.matches(row) && (!recent || row.domain_flag(d).is_some());
+                    table_view(r, keep, collapse.get(), sort.get())
+                })
             })
-        })
-    });
-    let flagged_names =
-        Memo::new(move |_| domains.with(|d| d.values().filter(|i| i.flag().is_some()).count()));
+        });
+        Self {
+            iface: RwSignal::new(iface),
+            rows,
+            graph: RwSignal::new(Graph::default()),
+            hosts: RwSignal::new(Hosts::default()),
+            domains,
+            ptrs: RwSignal::new(Ptrs::new()),
+            ptr_on: RwSignal::new(true),
+            collapse,
+            recent_only,
+            notice: RwSignal::new(None),
+            status,
+            tab: RwSignal::new(Tab::Packets),
+            query,
+            rules,
+            sort,
+            selected: RwSignal::new(None),
+            inspection: RwSignal::new(None),
+            mitm: RwSignal::new(MitmState::default()),
+            exchanges: RwSignal::new(Vec::new()),
+            busy: Signal::derive(move || {
+                status.with(|s| matches!(s.state.as_str(), "pending" | "capturing"))
+            }),
+            filter,
+            table,
+            flagged_names: Memo::new(move |_| {
+                domains.with(|d| d.values().filter(|i| i.flag().is_some()).count())
+            }),
+        }
+    }
+}
 
+/// The whole window: toolbar, tabs and the sheet of the chosen tab.
+fn app() -> impl IntoView {
+    let ifaces = interfaces();
+    let app = App::new(ifaces.first().cloned().unwrap_or_default());
+    listen_capture(&app);
+    listen_results(&app);
+    let inspect = Callback::new(move |no: u64| post_message(&format!("inspect {no}")));
+    // Ask for the detail of each newly clicked packet.
+    Effect::new(move |_| {
+        if let Some(no) = app
+            .selected
+            .get()
+            .and_then(|i| app.rows.with_untracked(|r| r.get(i).map(|r| r.no)))
+        {
+            inspect.run(no);
+        }
+    });
+    // The shell may have finished the launch authorization before this page loaded.
+    post_message("hello");
+    view! {
+        <div class="app">
+            <header class="toolbar">
+                <div class="brand">
+                    <h1>"wireshark-rs"</h1>
+                    <p>"Live packet capture"</p>
+                </div>
+                {controls(&app, ifaces)}
+                {status_line(&app)}
+                {mitm_banner(app.mitm)}
+            </header>
+            {sheet_bar(&app)}
+            {sheet(&app, inspect)}
+        </div>
+    }
+}
+
+/// Follows the capture: packets, its status, domain data and PTR names.
+fn listen_capture(app: &App) {
+    let App {
+        rows,
+        graph,
+        hosts,
+        status,
+        domains,
+        ptrs,
+        ptr_on,
+        ..
+    } = *app;
     // The handles live as long as the page, so they are never removed.
     window_event_listener_untyped("pkts", move |ev| {
         let Some(batch) = detail::<Vec<Row>>(ev) else {
@@ -198,6 +290,18 @@ fn App() -> impl IntoView {
             post_message(&format!("ptr {}", new.join(" ")));
         }
     });
+}
+
+/// Follows what the shell answers: packet detail, proxy state, decrypted
+/// requests and notices.
+fn listen_results(app: &App) {
+    let App {
+        inspection,
+        mitm,
+        exchanges,
+        notice,
+        ..
+    } = *app;
     window_event_listener_untyped("inspect", move |ev| {
         if let Some(i) = detail::<Inspection>(ev) {
             inspection.set(Some(i));
@@ -223,16 +327,6 @@ fn App() -> impl IntoView {
             });
         }
     });
-    let inspect = Callback::new(move |no: u64| post_message(&format!("inspect {no}")));
-    // Ask for the detail of each newly clicked packet.
-    Effect::new(move |_| {
-        if let Some(no) = selected
-            .get()
-            .and_then(|i| rows.with_untracked(|r| r.get(i).map(|r| r.no)))
-        {
-            inspect.run(no);
-        }
-    });
     let notice_seq = StoredValue::new(0_u64);
     window_event_listener_untyped("notice", move |ev| {
         if let Some(n) = detail::<Notice>(ev) {
@@ -250,236 +344,307 @@ fn App() -> impl IntoView {
             );
         }
     });
+}
 
-    // Shown rows in arrival order, without collapsing: every packet that passes the filter.
-    let shown_rows = move || -> Vec<Row> {
-        let f = filter.get_untracked();
-        let recent = recent_only.get_untracked();
-        domains.with_untracked(|d| {
-            rows.with_untracked(|r| {
-                r.iter()
-                    .filter(|row| f.matches(row) && (!recent || row.domain_flag(d).is_some()))
-                    .cloned()
-                    .collect()
-            })
+/// Shown rows in arrival order, without collapsing: every packet that passes the filter.
+fn shown_rows(app: &App) -> Vec<Row> {
+    let f = app.filter.get_untracked();
+    let recent = app.recent_only.get_untracked();
+    app.domains.with_untracked(|d| {
+        app.rows.with_untracked(|r| {
+            r.iter()
+                .filter(|row| f.matches(row) && (!recent || row.domain_flag(d).is_some()))
+                .cloned()
+                .collect()
         })
-    };
-    let export = move |format: String| match format.as_str() {
-        "CSV" => post_message(&format!("save packets.csv\n{}", model::csv(&shown_rows()))),
-        "JSON" => {
-            let json = serde_json::to_string_pretty(&shown_rows()).expect("rows serialize");
-            post_message(&format!("save packets.json\n{json}"));
-        }
+    })
+}
+
+/// Asks the shell to save the capture as `format`: `CSV`, `JSON` or pcap.
+fn export(app: &App, format: &str) {
+    match format {
+        "CSV" => post_message(&format!(
+            "save packets.csv\n{}",
+            model::csv(&shown_rows(app))
+        )),
+        "JSON" => match serde_json::to_string_pretty(&shown_rows(app)) {
+            Ok(json) => post_message(&format!("save packets.json\n{json}")),
+            Err(e) => app.notice.set(Some(Notice {
+                ok: false,
+                text: format!("JSON export failed: {e}"),
+            })),
+        },
         _ => post_message("save-pcap"),
-    };
+    }
+}
+
+/// Clears the last capture and starts one on the chosen interface.
+fn start(app: &App) {
+    app.selected.set(None);
+    app.inspection.set(None);
+    app.rows.set(Vec::new());
+    app.graph.set(Graph::default());
+    app.hosts.set(Hosts::default());
+    post_message(&format!("start {}", app.iface.get()));
+}
+
+/// Interface choice, Start, Stop and Export.
+fn controls(app: &App, ifaces: Vec<String>) -> impl IntoView + use<> {
+    let app = *app;
+    let busy = app.busy;
+    view! {
+        <div class="controls">
+            {select("iface", "Interface", Signal::stored(ifaces), app.iface, busy)}
+            <button class="btn btn-primary" disabled=busy on:click=move |_| start(&app)>
+                "Start"
+            </button>
+            <button
+                class="btn btn-secondary"
+                disabled=move || !busy.get()
+                on:click=move |_| post_message("stop")
+            >
+                "Stop"
+            </button>
+            {export_menu(
+                Signal::derive(move || app.rows.with(Vec::is_empty)),
+                Callback::new(move |format: String| export(&app, &format)),
+            )}
+        </div>
+    }
+}
+
+/// Capture status, the last notice, and the toggles of the lookups and the proxy.
+fn status_line(app: &App) -> impl IntoView + use<> {
+    let App {
+        status,
+        notice,
+        ptr_on,
+        mitm,
+        rows,
+        ..
+    } = *app;
+    view! {
+        <div class="status-line">
+            <span
+                class="status"
+                role="status"
+                aria-live="polite"
+                data-state=move || status.with(|s| s.state.clone())
+            >
+                <span class="dot"></span>
+                {move || status.with(|s| s.text.clone())}
+            </span>
+            {move || {
+                notice.get().map(|n| view! {
+                    <span class="notice" class:is-error=!n.ok role="status">{n.text}</span>
+                })
+            }}
+            {recent_alert(app)}
+            <button
+                type="button"
+                class="chip chip-filter ptr-toggle"
+                aria-pressed=move || ptr_on.get().to_string()
+                title="Look up the reverse DNS (PTR) name of every address seen, through the system resolver. The lookups show up in the capture as DNS traffic."
+                on:click=move |_| ptr_on.update(|p| *p = !*p)
+            >
+                "PTR names"
+            </button>
+            <button
+                type="button"
+                class="chip chip-filter mitm-toggle"
+                aria-pressed=move || mitm.with(|m| m.on).to_string()
+                title="Intercept this machine's outgoing TCP and decrypt TLS on any port: redirects all TCP to this app and trusts its certificate system-wide while on. Off by default."
+                on:click=move |_| {
+                    let on = !mitm.with_untracked(|m| m.on);
+                    post_message(if on { "mitm on" } else { "mitm off" });
+                }
+            >
+                "HTTPS proxy"
+            </button>
+            <span class="count">{move || rows.with(|r| r.last().map_or(0, |r| r.no))} " packets"</span>
+        </div>
+    }
+}
+
+/// Count of recently registered domains; a click lists their packets.
+fn recent_alert(app: &App) -> impl IntoView + use<> {
+    let App {
+        flagged_names,
+        recent_only,
+        tab,
+        ..
+    } = *app;
+    view! {
+        <Show when=move || { flagged_names.get() > 0 }>
+            <button
+                type="button"
+                class="chip chip-warning recent-alert"
+                title="Domains registered or transferred in the last 30 days. Click to list their packets."
+                on:click=move |_| {
+                    recent_only.set(true);
+                    tab.set(Tab::Packets);
+                }
+            >
+                {move || match flagged_names.get() {
+                    1 => "⚠ 1 recent domain".to_owned(),
+                    n => format!("⚠ {n} recent domains"),
+                }}
+            </button>
+        </Show>
+    }
+}
+
+/// Tabs, and the search and filters of the packet table.
+fn sheet_bar(app: &App) -> impl IntoView + use<> {
+    let App {
+        tab,
+        rows,
+        graph,
+        hosts,
+        exchanges,
+        collapse,
+        recent_only,
+        query,
+        rules,
+        table,
+        ..
+    } = *app;
+    view! {
+        <div class="sheet-bar">
+            {sheet_tabs(
+                tab,
+                Signal::derive(move || rows.with(Vec::len)),
+                Signal::derive(move || graph.with(Graph::hosts)),
+                Signal::derive(move || hosts.with(|h| h.0.len())),
+                Signal::derive(move || exchanges.with(Vec::len)),
+            )}
+            <Show when=move || tab.get() == Tab::Packets>
+                <div class="filter" role="search">
+                    <button
+                        type="button"
+                        class="chip chip-filter"
+                        aria-pressed=move || collapse.get().to_string()
+                        title="Show each flow (protocol, source, destination) once, with its packet count and size range"
+                        on:click=move |_| collapse.update(|c| *c = !*c)
+                    >
+                        "Collapse repeats"
+                    </button>
+                    <button
+                        type="button"
+                        class="chip chip-filter"
+                        aria-pressed=move || recent_only.get().to_string()
+                        title="Only packets to or from domains registered or transferred in the last 30 days"
+                        on:click=move |_| recent_only.update(|c| *c = !*c)
+                    >
+                        "Recent domains"
+                    </button>
+                    <input
+                        class="input"
+                        type="search"
+                        placeholder="Filter: dns | ^10.0 & !udp, 10.0.0.0/8"
+                        title="Terms side by side or joined by & must all match; | means or; ! negates; ( ) groups; ^term starts a word, $term ends a word, =term is a whole word; \"quoted text\" keeps spaces; 10.0.0.0/8 matches an address block."
+                        aria-label="Filter packets"
+                        prop:value=move || query.get()
+                        on:input=move |ev| query.set(event_target_value(&ev))
+                    />
+                    {filter_dialog(
+                        rules,
+                        rows,
+                        Signal::derive(move || (table.with(|v| v.rows.len()), rows.with(Vec::len))),
+                    )}
+                    <span class="filter-count">
+                        {move || format!("{} of {}", table.with(|v| v.rows.len()), rows.with(Vec::len))}
+                    </span>
+                </div>
+            </Show>
+        </div>
+    }
+}
+
+/// The sheet of the chosen tab; the other sheets stay mounted but hidden.
+fn sheet(app: &App, inspect: Callback<u64>) -> impl IntoView + use<> {
+    let App {
+        tab,
+        rows,
+        graph,
+        hosts,
+        domains,
+        ptrs,
+        selected,
+        inspection,
+        exchanges,
+        query,
+        table,
+        sort,
+        ..
+    } = *app;
     let show_in_table = Callback::new(move |term: String| {
         query.set(term);
         tab.set(Tab::Packets);
     });
-    // The shell may have finished the launch authorization before this page loaded.
-    post_message("hello");
-
-    let start = move |_| {
-        selected.set(None);
-        inspection.set(None);
-        rows.set(Vec::new());
-        graph.set(Graph::default());
-        hosts.set(Hosts::default());
-        post_message(&format!("start {}", iface.get()));
-    };
-
     view! {
-        <div class="app">
-            <header class="toolbar">
-                <div class="brand">
-                    <h1>"wireshark-rs"</h1>
-                    <p>"Live packet capture"</p>
+        <main class="card sheet" data-first-tab=move || (tab.get() == Tab::Packets).to_string()>
+            <div
+                role="tabpanel"
+                id="panel-packets"
+                aria-labelledby="tab-packets"
+                hidden=move || tab.get() != Tab::Packets
+            >
+                <div class="packets-split">
+                    {packet_table(rows, table, sort, domains, ptrs, selected)}
+                    {inspector(rows, selected, inspection, exchanges, ptrs, inspect)}
                 </div>
-                <div class="controls">
-                    <Select
-                        id="iface"
-                        label="Interface"
-                        options=Signal::stored(ifaces)
-                        value=iface
-                        disabled=busy
-                    />
-                    <button class="btn btn-primary" disabled=busy on:click=start>
-                        "Start"
-                    </button>
-                    <button
-                        class="btn btn-secondary"
-                        disabled=move || !busy.get()
-                        on:click=move |_| post_message("stop")
-                    >
-                        "Stop"
-                    </button>
-                    <ExportMenu
-                        disabled=Signal::derive(move || rows.with(Vec::is_empty))
-                        on_pick=Callback::new(export)
-                    />
-                </div>
-                <div class="status-line">
-                    <span
-                        class="status"
-                        role="status"
-                        aria-live="polite"
-                        data-state=move || status.with(|s| s.state.clone())
-                    >
-                        <span class="dot"></span>
-                        {move || status.with(|s| s.text.clone())}
-                    </span>
-                    {move || {
-                        notice.get().map(|n| view! {
-                            <span class="notice" class:is-error=!n.ok role="status">{n.text}</span>
-                        })
-                    }}
-                    <Show when=move || { flagged_names.get() > 0 }>
-                        <button
-                            type="button"
-                            class="chip chip-warning recent-alert"
-                            title="Domains registered or transferred in the last 30 days. Click to list their packets."
-                            on:click=move |_| {
-                                recent_only.set(true);
-                                tab.set(Tab::Packets);
-                            }
-                        >
-                            {move || match flagged_names.get() {
-                                1 => "⚠ 1 recent domain".to_owned(),
-                                n => format!("⚠ {n} recent domains"),
-                            }}
-                        </button>
-                    </Show>
-                    <button
-                        type="button"
-                        class="chip chip-filter ptr-toggle"
-                        aria-pressed=move || ptr_on.get().to_string()
-                        title="Look up the reverse DNS (PTR) name of every address seen, through the system resolver. The lookups show up in the capture as DNS traffic."
-                        on:click=move |_| ptr_on.update(|p| *p = !*p)
-                    >
-                        "PTR names"
-                    </button>
-                    <button
-                        type="button"
-                        class="chip chip-filter mitm-toggle"
-                        aria-pressed=move || mitm.with(|m| m.on).to_string()
-                        title="Intercept this machine's outgoing TCP and decrypt TLS on any port: redirects all TCP to this app and trusts its certificate system-wide while on. Off by default."
-                        on:click=move |_| {
-                            let on = !mitm.with_untracked(|m| m.on);
-                            post_message(if on { "mitm on" } else { "mitm off" });
-                        }
-                    >
-                        "HTTPS proxy"
-                    </button>
-                    <span class="count">{seen} " packets"</span>
-                </div>
-                <MitmBanner mitm />
-            </header>
-
-            <div class="sheet-bar">
-                <SheetTabs
-                    tab
-                    packets=Signal::derive(move || rows.with(Vec::len))
-                    hosts=Signal::derive(move || graph.with(Graph::hosts))
-                    blocks=Signal::derive(move || hosts.with(|h| h.0.len()))
-                    requests=Signal::derive(move || exchanges.with(Vec::len))
-                />
-                <Show when=move || tab.get() == Tab::Packets>
-                    <div class="filter" role="search">
-                        <button
-                            type="button"
-                            class="chip chip-filter"
-                            aria-pressed=move || collapse.get().to_string()
-                            title="Show each flow (protocol, source, destination) once, with its packet count and size range"
-                            on:click=move |_| collapse.update(|c| *c = !*c)
-                        >
-                            "Collapse repeats"
-                        </button>
-                        <button
-                            type="button"
-                            class="chip chip-filter"
-                            aria-pressed=move || recent_only.get().to_string()
-                            title="Only packets to or from domains registered or transferred in the last 30 days"
-                            on:click=move |_| recent_only.update(|c| *c = !*c)
-                        >
-                            "Recent domains"
-                        </button>
-                        <input
-                            class="input"
-                            type="search"
-                            placeholder="Filter: dns | ^10.0 & !udp, 10.0.0.0/8"
-                            title="Terms side by side or joined by & must all match; | means or; ! negates; ( ) groups; ^term starts a word, $term ends a word, =term is a whole word; \"quoted text\" keeps spaces; 10.0.0.0/8 matches an address block."
-                            aria-label="Filter packets"
-                            prop:value=move || query.get()
-                            on:input=move |ev| query.set(event_target_value(&ev))
-                        />
-                        <FilterDialog
-                            rules
-                            rows
-                            counts=Signal::derive(move || (view.with(|v| v.rows.len()), rows.with(Vec::len)))
-                        />
-                        <span class="filter-count">
-                            {move || format!("{} of {}", view.with(|v| v.rows.len()), rows.with(Vec::len))}
-                        </span>
-                    </div>
-                </Show>
             </div>
-            <main class="card sheet" data-first-tab=move || (tab.get() == Tab::Packets).to_string()>
-                <div
-                    role="tabpanel"
-                    id="panel-packets"
-                    aria-labelledby="tab-packets"
-                    hidden=move || tab.get() != Tab::Packets
-                >
-                    <div class="packets-split">
-                        <PacketTable rows view sort domains ptrs selected />
-                        <Inspector rows selected inspection exchanges ptrs request=inspect />
-                    </div>
-                </div>
-                <div
-                    role="tabpanel"
-                    id="panel-graph"
-                    aria-labelledby="tab-graph"
-                    hidden=move || tab.get() != Tab::Graph
-                >
-                    <GraphPage graph domains ptrs active=Signal::derive(move || tab.get() == Tab::Graph) />
-                </div>
-                <div
-                    role="tabpanel"
-                    id="panel-networks"
-                    aria-labelledby="tab-networks"
-                    hidden=move || tab.get() != Tab::Networks
-                >
-                    <NetworksPage
-                        hosts
-                        domains
-                        ptrs
-                        active=Signal::derive(move || tab.get() == Tab::Networks)
-                        on_show=show_in_table
-                    />
-                </div>
-                <div
-                    role="tabpanel"
-                    id="panel-https"
-                    aria-labelledby="tab-https"
-                    hidden=move || tab.get() != Tab::Https
-                >
-                    <div class="https-list">
-                        <Show when=move || exchanges.with(Vec::is_empty)>
-                            <p class="inspector-note">
-                                "No decrypted requests. Turn on the HTTPS proxy: web traffic from this machine shows here."
-                            </p>
-                        </Show>
-                        // Newest first, like the packet table.
-                        <For
-                            each=move || exchanges.with(|x| x.iter().rev().cloned().collect::<Vec<_>>())
-                            key=|e| e.id
-                            let:ex
-                        >
-                            <ExchangeView ex />
-                        </For>
-                    </div>
-                </div>
-            </main>
+            <div
+                role="tabpanel"
+                id="panel-graph"
+                aria-labelledby="tab-graph"
+                hidden=move || tab.get() != Tab::Graph
+            >
+                {graph_page(graph, Signal::derive(move || tab.get() == Tab::Graph), domains, ptrs)}
+            </div>
+            <div
+                role="tabpanel"
+                id="panel-networks"
+                aria-labelledby="tab-networks"
+                hidden=move || tab.get() != Tab::Networks
+            >
+                {networks_page(
+                    hosts,
+                    domains,
+                    ptrs,
+                    Signal::derive(move || tab.get() == Tab::Networks),
+                    show_in_table,
+                )}
+            </div>
+            <div
+                role="tabpanel"
+                id="panel-https"
+                aria-labelledby="tab-https"
+                hidden=move || tab.get() != Tab::Https
+            >
+                {https_list(exchanges)}
+            </div>
+        </main>
+    }
+}
+
+/// Requests the proxy decrypted, newest first like the packet table.
+fn https_list(exchanges: RwSignal<Vec<Exchange>>) -> impl IntoView {
+    view! {
+        <div class="https-list">
+            <Show when=move || exchanges.with(Vec::is_empty)>
+                <p class="inspector-note">
+                    "No decrypted requests. Turn on the HTTPS proxy: web traffic from this machine shows here."
+                </p>
+            </Show>
+            <For
+                each=move || exchanges.with(|x| x.iter().rev().cloned().collect::<Vec<_>>())
+                key=|e| e.id
+                let:ex
+            >
+                {exchange_view(&ex, false)}
+            </For>
         </div>
     }
 }
@@ -487,8 +652,7 @@ fn App() -> impl IntoView {
 /// Export button with a menu of formats. CSV and JSON hold the packets the
 /// table shows (every packet that passes the filter); pcap holds the whole
 /// capture, payloads included.
-#[component]
-fn ExportMenu(disabled: Signal<bool>, on_pick: Callback<String>) -> impl IntoView {
+fn export_menu(disabled: Signal<bool>, on_pick: Callback<String>) -> impl IntoView {
     const ITEMS: [(&str, &str); 3] = [
         ("CSV", "Shown packets as CSV"),
         ("JSON", "Shown packets as JSON"),
@@ -550,9 +714,9 @@ fn ExportMenu(disabled: Signal<bool>, on_pick: Callback<String>) -> impl IntoVie
     }
 }
 
-/// Worksheet-style tabs on top of the sheet card. Arrow keys move between them.
-#[component]
-fn SheetTabs(
+/// Worksheet-style tabs on top of the sheet card, each with its count.
+/// Arrow keys move between them.
+fn sheet_tabs(
     tab: RwSignal<Tab>,
     packets: Signal<usize>,
     hosts: Signal<usize>,
@@ -636,8 +800,7 @@ fn SheetTabs(
 }
 
 /// Warning shown while the HTTPS proxy runs, with how to use it.
-#[component]
-fn MitmBanner(mitm: RwSignal<MitmState>) -> impl IntoView {
+fn mitm_banner(mitm: RwSignal<MitmState>) -> impl IntoView {
     move || {
         let m = mitm.get();
         if let Some(e) = m.error {

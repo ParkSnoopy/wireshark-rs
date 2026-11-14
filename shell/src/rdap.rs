@@ -15,7 +15,7 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// `(top-level domains, RDAP base URL)` from the bootstrap file.
 type Servers = Result<Vec<(Vec<String>, String)>, String>;
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Dates {
     /// `YYYY-MM-DD` of the latest registration, and its age in days.
     pub registered: Option<String>,
@@ -59,21 +59,18 @@ impl Rdap {
                 let Some(site) = registrable(&name) else {
                     continue;
                 };
-                let dates = match sites.get(&site) {
-                    Some(d) => d.clone(),
-                    None => {
-                        // A failed bootstrap download is tried again too.
-                        if servers.as_ref().is_some_and(Result::is_err) {
-                            servers = None;
-                        }
-                        let list = servers.get_or_insert_with(|| bootstrap(&agent));
-                        let d = lookup(&agent, list, &site);
-                        if d.error.is_none() {
-                            sites.insert(site.clone(), d.clone());
-                        }
-                        d
+                let dates = sites.get(&site).cloned().unwrap_or_else(|| {
+                    // A failed bootstrap download is tried again too.
+                    if servers.as_ref().is_some_and(Result::is_err) {
+                        servers = None;
                     }
-                };
+                    let list = servers.get_or_insert_with(|| bootstrap(&agent));
+                    let d = lookup(&agent, list, &site);
+                    if d.error.is_none() {
+                        sites.insert(site.clone(), d.clone());
+                    }
+                    d
+                });
                 emit(DomainInfo { name, site, dates });
             }
         });
@@ -191,7 +188,7 @@ fn dates(v: &Value, today: i64) -> Dates {
     }
 }
 
-/// Days since 1970-01-01 of a `YYYY-MM-DD` date (H. Hinnant's days_from_civil).
+/// Days since 1970-01-01 of a `YYYY-MM-DD` date (H. Hinnant's `days_from_civil`).
 fn day_number(date: &str) -> Option<i64> {
     let (y, m, d): (i64, i64, i64) = (
         date.get(0..4)?.parse().ok()?,
@@ -231,7 +228,8 @@ mod tests {
             { "eventAction": "expiration", "eventDate": "2027-11-01T00:00:00Z" },
             { "eventAction": "transfer", "eventDate": "2026-10-30T00:00:00Z" },
         ]});
-        let d = dates(&v, day_number("2026-11-13").unwrap());
+        // Unknown dates make every assertion below fail.
+        let d = day_number("2026-11-13").map_or_else(Dates::default, |today| dates(&v, today));
         assert_eq!(
             (d.registered.as_deref(), d.registered_days),
             (Some("2026-11-01"), Some(12))
@@ -253,7 +251,7 @@ mod tests {
         let d = lookup(&agent, &servers, &name);
         assert_eq!(d.error, None);
         assert!(d.registered.is_some(), "{d:?}");
-        eprintln!("{name}: {d:?}");
+        let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("{name}: {d:?}\n"));
     }
 
     #[test]

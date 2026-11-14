@@ -2,6 +2,12 @@
 name = "wireshark-ui"
 version = "0.1.0"
 edition = "2024"
+description = "Leptos UI of wireshark-rs, built to wasm and embedded in the shell"
+# Embedded in the shell binary, never published to crates.io.
+publish = false
+
+[lints]
+workspace = true
 
 [dependencies]
 leptos = { version = "0.8", features = ["csr"] }

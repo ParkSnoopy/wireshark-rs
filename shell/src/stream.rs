@@ -35,7 +35,7 @@ pub struct Inspection {
 
 /// Data one side sent before the other side answered. A UDP datagram is
 /// a turn of its own.
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Turn {
     /// Sent by the side that sent first in the capture: the client, usually.
     pub client: bool,
@@ -111,7 +111,7 @@ struct Turns {
 }
 
 impl Turns {
-    fn add(&mut self, no: u64, s: &Segment) {
+    fn add(&mut self, no: u64, s: &Segment<'_>) {
         let client = *self.client.get_or_insert(s.src) == s.src;
         let next = &mut self.next[usize::from(!client)];
         let mut data = s.payload;
@@ -157,7 +157,10 @@ impl Turns {
                 data: Vec::new(),
             });
         }
-        let t = self.list.last_mut().expect("a turn was pushed or extended");
+        // A turn was pushed or is extended, so the list is not empty.
+        let Some(t) = self.list.last_mut() else {
+            return;
+        };
         t.last = no;
         t.len += data.len();
         t.gaps += gap;
@@ -171,7 +174,7 @@ impl Turns {
     }
 }
 
-/// The TCP or UDP part of an IPv4 or IPv6 packet. Ethernet padding past
+/// The TCP or UDP part of an `IPv4` or `IPv6` packet. Ethernet padding past
 /// the IP length is cut off.
 fn segment(ethertype: u16, d: &[u8]) -> Option<Segment<'_>> {
     let (src, dst, proto, start, end): (IpAddr, IpAddr, u8, usize, usize) = match ethertype {
@@ -236,7 +239,7 @@ mod tests {
 
     /// IPv4/TCP packet from `sport` to `dport` with `payload`.
     fn tcp(sport: u16, dport: u16, seq: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
-        let total = u16::try_from(40 + payload.len()).unwrap();
+        let total = u16::try_from(40 + payload.len()).unwrap_or(u16::MAX);
         let (src, dst) = if sport < dport {
             ([10, 0, 0, 2], [10, 0, 0, 1])
         } else {
@@ -308,8 +311,8 @@ mod tests {
     #[test]
     fn payload_offset_and_bad_input() {
         let p = tcp(40000, 80, 1, 0x18, b"hi");
-        let s = segment(0x0800, &p).unwrap();
-        assert_eq!((s.at, s.payload), (40, &b"hi"[..]));
+        let s = segment(0x0800, &p);
+        assert_eq!(s.map(|s| (s.at, s.payload)), Some((40, &b"hi"[..])));
         for len in 0..p.len() {
             segment(0x0800, &p[..len]);
             segment(0x86dd, &p[..len]);

@@ -8,8 +8,8 @@ use leptos::ev::MouseEvent;
 use leptos::prelude::*;
 
 use crate::model::{Block, Cidr, DomainInfo, Domains, GROUPINGS, Hosts, Ptrs, blocks, bytes};
-use crate::select::Select;
-use crate::tip::{Card, Tip, facts};
+use crate::select::select;
+use crate::tip::{Card, facts, tip};
 
 /// Row under the pointer, for the hover card.
 #[derive(Clone, PartialEq)]
@@ -38,14 +38,56 @@ impl Pointer {
     }
 }
 
-#[component]
-pub fn NetworksPage(
+/// Domains seen, recently registered ones first, with their RDAP dates.
+fn domains_section(
+    domain_rows: Memo<Vec<DomainInfo>>,
+    pointer: Pointer,
+    on_show: Callback<String>,
+) -> impl IntoView {
+    view! {
+        <section class="net-section" aria-labelledby="domains-title">
+            <div class="net-head">
+                <h3 id="domains-title">"Domains"</h3>
+                <span class="net-note">
+                    "Registration and transfer dates from RDAP. Flagged when 30 days old or less."
+                </span>
+            </div>
+            <table class="data-table" on:mouseleave=move |_| pointer.hover.set(None)>
+                <thead>
+                    <tr>
+                        <th>"Name"</th>
+                        <th>"Registered domain"</th>
+                        <th>"Registered"</th>
+                        <th>"Transferred"</th>
+                        <th>"Status"</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <Show when=move || domain_rows.with(Vec::is_empty)>
+                        <tr class="empty">
+                            <td colspan="6">"No host names yet. They come from DNS answers, TLS and HTTP."</td>
+                        </tr>
+                    </Show>
+                    <For
+                        each=move || domain_rows.get()
+                        key=|d| (d.name.clone(), d.registered.clone(), d.error.clone())
+                        children=move |d| domain_row(&d, pointer, on_show)
+                    />
+                </tbody>
+            </table>
+        </section>
+    }
+}
+
+/// Address blocks and the hosts in them. Grouping runs only while `active`
+/// (the page is visible). `on_show` shows the packets of a block
+/// (`10.0.0.0/8`) or a name in the packet table.
+pub fn networks_page(
     hosts: RwSignal<Hosts>,
     domains: RwSignal<Domains>,
     ptrs: RwSignal<Ptrs>,
-    /// The page is visible: grouping runs only then.
     active: Signal<bool>,
-    /// Shows the packets of a block (`10.0.0.0/8`) or a name in the packet table.
     on_show: Callback<String>,
 ) -> impl IntoView {
     let grouping = RwSignal::new(GROUPINGS[0].0.to_owned());
@@ -81,12 +123,13 @@ pub fn NetworksPage(
             <section class="net-section" aria-labelledby="blocks-title">
                 <div class="net-head">
                     <h3 id="blocks-title">"Address blocks"</h3>
-                    <Select
-                        id="grouping"
-                        label="Group by"
-                        options=Signal::stored(GROUPINGS.map(|g| g.0.to_owned()).to_vec())
-                        value=grouping
-                    />
+                    {select(
+                        "grouping",
+                        "Group by",
+                        Signal::stored(GROUPINGS.map(|g| g.0.to_owned()).to_vec()),
+                        grouping,
+                        Signal::stored(false),
+                    )}
                     <span class="filter-count">{move || format!("{} blocks", list.with(Vec::len))}</span>
                 </div>
                 <table class="data-table" on:mouseleave=leave>
@@ -110,55 +153,25 @@ pub fn NetworksPage(
                         <For
                             each=move || list.get()
                             key=|b| (b.cidr, b.packets, b.hosts.len())
-                            children=move |b| block_rows(b, open, domains, ptrs, pointer, on_show)
+                            children=move |b| block_rows(&b, open, domains, ptrs, pointer, on_show)
                         />
                     </tbody>
                 </table>
             </section>
-            <section class="net-section" aria-labelledby="domains-title">
-                <div class="net-head">
-                    <h3 id="domains-title">"Domains"</h3>
-                    <span class="net-note">
-                        "Registration and transfer dates from RDAP. Flagged when 30 days old or less."
-                    </span>
-                </div>
-                <table class="data-table" on:mouseleave=leave>
-                    <thead>
-                        <tr>
-                            <th>"Name"</th>
-                            <th>"Registered domain"</th>
-                            <th>"Registered"</th>
-                            <th>"Transferred"</th>
-                            <th>"Status"</th>
-                            <th></th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <Show when=move || domain_rows.with(Vec::is_empty)>
-                            <tr class="empty">
-                                <td colspan="6">"No host names yet. They come from DNS answers, TLS and HTTP."</td>
-                            </tr>
-                        </Show>
-                        <For
-                            each=move || domain_rows.get()
-                            key=|d| (d.name.clone(), d.registered.clone(), d.error.clone())
-                            children=move |d| domain_row(d, pointer, on_show)
-                        />
-                    </tbody>
-                </table>
-            </section>
+            {domains_section(domain_rows, pointer, on_show)}
             {move || {
                 let h = pointer.hover.get()?;
                 let (title, list, flag) = list.with(|l| {
                     hosts.with(|hs| ptrs.with(|p| domains.with(|d| card(l, hs, &h, p, d))))
                 })?;
-                Some(view! {
-                    <Tip cursor=pointer.cursor>
+                Some(tip(
+                    pointer.cursor,
+                    view! {
                         <h4>{title}</h4>
                         {flag.map(|why| view! { <p class="tip-flag">{why}</p> })}
                         {facts("tip-grid", list)}
-                    </Tip>
-                })
+                    },
+                ))
             }}
         </div>
     }
@@ -196,7 +209,7 @@ fn card(
                     .name
                     .clone()
                     .or_else(|| ptrs.get(ip).cloned().flatten())
-                    .map_or(ip.to_string(), |n| format!("{n} ({ip})"));
+                    .map_or_else(|| ip.to_string(), |n| format!("{n} ({ip})"));
                 let term = if n == 0 { "Busiest" } else { "" };
                 list.push((term, format!("{label} · {}", bytes(host.bytes))));
             }
@@ -210,7 +223,7 @@ fn card(
             let title = host
                 .name
                 .as_ref()
-                .map_or(ip.to_string(), |n| format!("{n} ({ip})"));
+                .map_or_else(|| ip.to_string(), |n| format!("{n} ({ip})"));
             let mut list = vec![
                 ("Block", b.cidr.to_string()),
                 ("Scope", scope_text(b)),
@@ -249,10 +262,8 @@ fn card(
                 .collect();
             addrs.sort();
             for (n, ip) in addrs.into_iter().enumerate() {
-                let text = match ptr_text(ip) {
-                    Some(p) => format!("{ip} · PTR {p}"),
-                    None => ip.to_string(),
-                };
+                let text =
+                    ptr_text(ip).map_or_else(|| ip.to_string(), |p| format!("{ip} · PTR {p}"));
                 list.push((if n == 0 { "Addresses" } else { "" }, text));
             }
             Some((name.clone(), list, flag_of(name)))
@@ -274,18 +285,21 @@ fn unique_names(b: &Block) -> Vec<String> {
 }
 
 fn scope_text(b: &Block) -> String {
-    b.scope
-        .map_or("public".to_owned(), |s| format!("{} ({})", s.kind, s.cidr))
+    b.scope.map_or_else(
+        || "public".to_owned(),
+        |s| format!("{} ({})", s.kind, s.cidr),
+    )
 }
 
+/// Row of block `b`, and the rows of its hosts while it is open.
 fn block_rows(
-    b: Block,
+    b: &Block,
     open: RwSignal<HashSet<String>>,
     domains: RwSignal<Domains>,
     ptrs: RwSignal<Ptrs>,
     pointer: Pointer,
     on_show: Callback<String>,
-) -> impl IntoView {
+) -> impl IntoView + use<> {
     let cidr = b.cidr.to_string();
     let key = StoredValue::new(cidr.clone());
     let is_open = move || key.with_value(|k| open.with(|o| o.contains(k)));
@@ -299,7 +313,7 @@ fn block_rows(
             });
         }
     };
-    let names = unique_names(&b);
+    let names = unique_names(b);
     let flagged = {
         let names = names.clone();
         move || {
@@ -315,7 +329,7 @@ fn block_rows(
         1..=2 => names.join(", "),
         n => format!("{}, {} and {} more", names[0], names[1], n - 2),
     };
-    let scope = scope_text(&b);
+    let scope = scope_text(b);
     let show = {
         let cidr = cidr.clone();
         move |_| on_show.run(cidr.clone())
@@ -325,7 +339,7 @@ fn block_rows(
         <tr class="block-row" class:flagged=flagged on:mousemove=pointer.track(Hover::Block(b.cidr))>
             <td>
                 <button type="button" class="disclosure" aria-expanded=move || is_open().to_string() on:click=toggle>
-                    {cidr.clone()}
+                    {cidr}
                 </button>
             </td>
             <td>{scope}</td>
@@ -347,11 +361,8 @@ fn block_rows(
                 .map(|(addr, h)| {
                     let addr = *addr;
                     let ip = addr.to_string();
-                    let label = match &h.name {
-                        Some(n) => format!("{n} ({ip})"),
-                        None => ip.clone(),
-                    };
-                    let iface = h.iface.as_ref().map(|i| i.name.clone()).unwrap_or_default();
+                    let label = h.name.as_ref().map_or_else(|| ip.clone(), |n| format!("{n} ({ip})"));
+                    let iface = h.iface.as_ref().map_or_else(String::new, |i| i.name.clone());
                     let ptr = move || ptrs.with(|p| p.get(&addr).cloned().flatten().map(|n| format!("PTR {n}")));
                     let show = move |_| on_show.run(ip.clone());
                     view! {
@@ -376,7 +387,11 @@ fn block_rows(
     }
 }
 
-fn domain_row(d: DomainInfo, pointer: Pointer, on_show: Callback<String>) -> impl IntoView {
+fn domain_row(
+    d: &DomainInfo,
+    pointer: Pointer,
+    on_show: Callback<String>,
+) -> impl IntoView + use<> {
     let status = match (d.flag(), &d.error) {
         (Some(why), _) => {
             view! { <span class="chip chip-warning">{format!("⚠ {why}")}</span> }.into_any()

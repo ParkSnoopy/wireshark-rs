@@ -5,18 +5,19 @@
 //! Each host is one card that lists what is known about it: names,
 //! address block, interface, traffic, the services it offers and the
 //! programs on it. Edges join hosts and name the services they carry.
-//! Hosts in the same special-purpose address block (10.0.0.0/8, fe80::/10,
-//! ...) are pulled together and framed with the block's CIDR.
+//! Hosts in the same special-purpose address block (`10.0.0.0/8`,
+//! `fe80::/10`, ...) are pulled together and framed with the block's CIDR.
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
 
 use leptos::ev::{KeyboardEvent, MouseEvent, PointerEvent, WheelEvent};
 use leptos::prelude::*;
 use leptos::svg::Svg;
 use wasm_bindgen::JsCast;
 
-use crate::model::{Domains, Graph, Node, Part, Ptrs, Rel, Scope, bytes, ptr_of};
-use crate::tip::{Card, Tip, facts};
+use crate::model::{DomainInfo, Domains, Graph, Node, Part, Ptrs, Rel, Scope, bytes, ptr_of};
+use crate::tip::{Card, facts, tip};
 
 /// Build log entries rendered, newest first.
 const LOG_ROWS: usize = 300;
@@ -143,85 +144,16 @@ impl Layout {
 }
 
 /// One layout step. Returns false once the layout has settled.
-fn step(s: &mut Sim, g: &Graph) -> bool {
-    place_new(s, g);
-    let a = s.alpha;
-    let held = s.held;
-    let b = &mut s.bodies;
-
-    // shortcut: all-pairs repulsion is O(n²); fine for a few hundred nodes.
-    // Use a Barnes-Hut quadtree if captures with thousands of hosts matter.
-    for i in 0..b.len() {
-        for j in i + 1..b.len() {
-            let (mut dx, mut dy) = (b[j].x - b[i].x, b[j].y - b[i].y);
-            let mut d2 = dx * dx + dy * dy;
-            if d2 > REPULSION_RANGE * REPULSION_RANGE {
-                continue;
-            }
-            if d2 < 1.0 {
-                // Bodies on the same spot: separate along a fixed direction.
-                (dx, dy, d2) = (1.0, 0.0, 1.0);
-            }
-            let f = REPULSION * a / d2;
-            b[i].vx -= dx * f;
-            b[i].vy -= dy * f;
-            b[j].vx += dx * f;
-            b[j].vy += dy * f;
-        }
-    }
-    for e in &g.edges {
-        let (dx, dy) = (b[e.to].x - b[e.from].x, b[e.to].y - b[e.from].y);
-        let len = dx.hypot(dy).max(1.0);
-        let f = (len - rest_length(e.rel)) / len * a * SPRING / 2.0;
-        b[e.to].vx -= dx * f;
-        b[e.to].vy -= dy * f;
-        b[e.from].vx += dx * f;
-        b[e.from].vy += dy * f;
-    }
-    // Cards are wide: push overlapping ones apart along the shorter way out.
-    let sizes: Vec<(f64, f64)> = g.nodes.iter().map(card_size).collect();
-    let fixed = |i: usize, b: &[Body]| b[i].pinned || held == Some(i);
-    for i in 0..b.len().min(sizes.len()) {
-        for j in i + 1..b.len().min(sizes.len()) {
-            let (dx, dy) = (b[j].x - b[i].x, b[j].y - b[i].y);
-            let ox = (sizes[i].0 + sizes[j].0) / 2.0 + CARD_GAP - dx.abs();
-            let oy = (sizes[i].1 + sizes[j].1) / 2.0 + CARD_GAP - dy.abs();
-            if ox <= 0.0 || oy <= 0.0 {
-                continue;
-            }
-            let (px, py) = if ox < oy {
-                (ox.copysign(dx) * COLLIDE, 0.0)
-            } else {
-                (0.0, oy.copysign(dy) * COLLIDE)
-            };
-            let (fi, fj) = match (fixed(i, b), fixed(j, b)) {
-                (true, true) => continue,
-                (true, false) => (0.0, 1.0),
-                (false, true) => (1.0, 0.0),
-                (false, false) => (0.5, 0.5),
-            };
-            b[i].x -= px * fi;
-            b[i].y -= py * fi;
-            b[j].x += px * fj;
-            b[j].y += py * fj;
-        }
-    }
-    let mut blocks: BTreeMap<&str, (f64, f64, f64)> = BTreeMap::new();
-    for (n, body) in g.nodes.iter().zip(b.iter()) {
-        if let Some(s) = block(n) {
-            let c = blocks.entry(s.cidr).or_default();
-            *c = (c.0 + body.x, c.1 + body.y, c.2 + 1.0);
-        }
-    }
-    for (n, body) in g.nodes.iter().zip(b.iter_mut()) {
-        body.vx -= body.x * GRAVITY * a;
-        body.vy -= body.y * GRAVITY * a;
-        if let Some(&(sx, sy, count)) = block(n).and_then(|s| blocks.get(s.cidr)) {
-            body.vx += (sx / count - body.x) * CLUSTER * a;
-            body.vy += (sy / count - body.y) * CLUSTER * a;
-        }
-    }
-    for (i, body) in b.iter_mut().enumerate() {
+fn step(sim: &mut Sim, graph: &Graph) -> bool {
+    place_new(sim, graph);
+    let alpha = sim.alpha;
+    let held = sim.held;
+    let bodies = &mut sim.bodies;
+    repel(bodies, alpha);
+    pull_edges(bodies, graph, alpha);
+    collide(bodies, graph, held);
+    pull_blocks(bodies, graph, alpha);
+    for (i, body) in bodies.iter_mut().enumerate() {
         if body.pinned || held == Some(i) {
             (body.vx, body.vy) = (0.0, 0.0);
             continue;
@@ -231,8 +163,108 @@ fn step(s: &mut Sim, g: &Graph) -> bool {
         body.x += body.vx;
         body.y += body.vy;
     }
-    s.alpha += (s.target - s.alpha) * ALPHA_DECAY;
-    s.alpha >= ALPHA_MIN || s.target > 0.0
+    sim.alpha = (sim.target - sim.alpha).mul_add(ALPHA_DECAY, sim.alpha);
+    sim.alpha >= ALPHA_MIN || sim.target > 0.0
+}
+
+/// Adds `force` times the direction `(dx, dy)` to the velocity of `body`.
+const fn push(body: &mut Body, (dx, dy): (f64, f64), force: f64) {
+    body.vx = dx.mul_add(force, body.vx);
+    body.vy = dy.mul_add(force, body.vy);
+}
+
+/// Moves `body` by `share` of `(dx, dy)`.
+const fn shift(body: &mut Body, (dx, dy): (f64, f64), share: f64) {
+    body.x = dx.mul_add(share, body.x);
+    body.y = dy.mul_add(share, body.y);
+}
+
+/// Pushes every two bodies closer than `REPULSION_RANGE` apart.
+fn repel(bodies: &mut [Body], alpha: f64) {
+    // shortcut: all-pairs repulsion is O(n²); fine for a few hundred nodes.
+    // Use a Barnes-Hut quadtree if captures with thousands of hosts matter.
+    for i in 0..bodies.len() {
+        for j in i + 1..bodies.len() {
+            let (mut dx, mut dy) = (bodies[j].x - bodies[i].x, bodies[j].y - bodies[i].y);
+            let mut dist2 = dx.mul_add(dx, dy * dy);
+            if dist2 > REPULSION_RANGE * REPULSION_RANGE {
+                continue;
+            }
+            if dist2 < 1.0 {
+                // Bodies on the same spot: separate along a fixed direction.
+                (dx, dy, dist2) = (1.0, 0.0, 1.0);
+            }
+            let force = REPULSION * alpha / dist2;
+            push(&mut bodies[i], (dx, dy), -force);
+            push(&mut bodies[j], (dx, dy), force);
+        }
+    }
+}
+
+/// Pulls the ends of each edge toward the edge's rest length.
+fn pull_edges(bodies: &mut [Body], graph: &Graph, alpha: f64) {
+    for e in &graph.edges {
+        let (from, to) = (bodies[e.from], bodies[e.to]);
+        let (dx, dy) = (to.x - from.x, to.y - from.y);
+        let len = dx.hypot(dy).max(1.0);
+        let force = (len - rest_length(e.rel)) / len * alpha * SPRING / 2.0;
+        push(&mut bodies[e.to], (dx, dy), -force);
+        push(&mut bodies[e.from], (dx, dy), force);
+    }
+}
+
+/// Cards are wide: pushes overlapping ones apart along the shorter way out.
+/// A pinned or held card stays; the other one moves the whole way.
+fn collide(bodies: &mut [Body], graph: &Graph, held: Option<usize>) {
+    let sizes: Vec<(f64, f64)> = graph.nodes.iter().map(card_size).collect();
+    let fixed = |i: usize, b: &[Body]| b[i].pinned || held == Some(i);
+    let count = bodies.len().min(sizes.len());
+    for i in 0..count {
+        for j in i + 1..count {
+            let (dx, dy) = (bodies[j].x - bodies[i].x, bodies[j].y - bodies[i].y);
+            let ox = f64::midpoint(sizes[i].0, sizes[j].0) + CARD_GAP - dx.abs();
+            let oy = f64::midpoint(sizes[i].1, sizes[j].1) + CARD_GAP - dy.abs();
+            if ox <= 0.0 || oy <= 0.0 {
+                continue;
+            }
+            let way = if ox < oy {
+                (ox.copysign(dx) * COLLIDE, 0.0)
+            } else {
+                (0.0, oy.copysign(dy) * COLLIDE)
+            };
+            let (share_i, share_j) = match (fixed(i, bodies), fixed(j, bodies)) {
+                (true, true) => continue,
+                (true, false) => (0.0, 1.0),
+                (false, true) => (1.0, 0.0),
+                (false, false) => (0.5, 0.5),
+            };
+            shift(&mut bodies[i], way, -share_i);
+            shift(&mut bodies[j], way, share_j);
+        }
+    }
+}
+
+/// Pulls every body toward the middle, and hosts toward the middle of
+/// their address block.
+fn pull_blocks(bodies: &mut [Body], graph: &Graph, alpha: f64) {
+    let mut blocks: BTreeMap<&str, (f64, f64, f64)> = BTreeMap::new();
+    for (n, body) in graph.nodes.iter().zip(bodies.iter()) {
+        if let Some(s) = block(n) {
+            let c = blocks.entry(s.cidr).or_default();
+            *c = (c.0 + body.x, c.1 + body.y, c.2 + 1.0);
+        }
+    }
+    for (n, body) in graph.nodes.iter().zip(bodies.iter_mut()) {
+        let at = (body.x, body.y);
+        push(body, at, -GRAVITY * alpha);
+        if let Some(&(sx, sy, count)) = block(n).and_then(|s| blocks.get(s.cidr)) {
+            push(
+                body,
+                (sx / count - at.0, sy / count - at.1),
+                CLUSTER * alpha,
+            );
+        }
+    }
 }
 
 /// Gives new hosts a start position on a golden-angle spiral, so none
@@ -249,7 +281,7 @@ fn place_new(s: &mut Sim, g: &Graph) {
     }
 }
 
-fn rest_length(rel: Rel) -> f64 {
+const fn rest_length(rel: Rel) -> f64 {
     match rel {
         Rel::Exchanges => 300.0,
         Rel::Connects => 340.0,
@@ -270,7 +302,7 @@ fn card_rows(n: &Node) -> usize {
 }
 
 fn card_height(rows: usize) -> f64 {
-    CARD_TITLE + 6.0 + CARD_LINE * rows as f64 + CARD_PAD
+    CARD_LINE.mul_add(rows as f64, CARD_TITLE + 6.0) + CARD_PAD
 }
 
 /// Width and height of the card of `n`, in world units.
@@ -309,7 +341,7 @@ fn card_content(n: &Node, ptr: Option<&str>) -> (String, Vec<CardLine>) {
     };
     let block = n
         .scope
-        .map_or("public".to_owned(), |s| format!("{} {}", s.kind, s.cidr));
+        .map_or_else(|| "public".to_owned(), |s| format!("{} {}", s.kind, s.cidr));
     let place = match &n.iface {
         Some(f) => format!("{block} · {}", iface_text(f.local, &f.name)),
         None => block,
@@ -349,97 +381,157 @@ fn edge_label(protos: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     if protos.len() > EDGE_PROTOS {
-        text.push_str(&format!(" +{}", protos.len() - EDGE_PROTOS));
+        let _ = write!(text, " +{}", protos.len() - EDGE_PROTOS);
     }
     text
 }
 
-/// Corners of the area the cards cover: `(x0, y0, x1, y1)`.
-fn extent(n: &Node, b: &Body) -> (f64, f64, f64, f64) {
+/// Corners of an area: `(x0, y0, x1, y1)`.
+type Corners = (f64, f64, f64, f64);
+
+/// Corners of the area the card of `n` covers.
+fn extent(n: &Node, b: &Body) -> Corners {
     let (w, h) = card_size(n);
     (b.x - w / 2.0, b.y - h / 2.0, b.x + w / 2.0, b.y + h / 2.0)
 }
 
-/// Frames around each address block: `(label, x, y, width, height)` in world units.
-fn hulls(g: &Graph, bodies: &[Body]) -> Vec<(String, f64, f64, f64, f64)> {
-    let mut boxes: BTreeMap<&str, (&str, f64, f64, f64, f64)> = BTreeMap::new();
+/// Frame around an address block: `(label, x, y, width, height)` in world units.
+type Hull = (String, f64, f64, f64, f64);
+
+/// Frames around each address block.
+fn hulls(g: &Graph, bodies: &[Body]) -> Vec<Hull> {
+    // Per block: its kind and the corners its cards cover.
+    let mut boxes: BTreeMap<&str, (&str, Corners)> = BTreeMap::new();
     for (n, b) in g.nodes.iter().zip(bodies) {
         let Some(s) = block(n) else { continue };
         let (x0, y0, x1, y1) = extent(n, b);
-        let e = boxes.entry(s.cidr).or_insert((s.kind, x0, y0, x1, y1));
-        *e = (e.0, e.1.min(x0), e.2.min(y0), e.3.max(x1), e.4.max(y1));
+        let (_, c) = boxes.entry(s.cidr).or_insert((s.kind, (x0, y0, x1, y1)));
+        *c = (c.0.min(x0), c.1.min(y0), c.2.max(x1), c.3.max(y1));
     }
     boxes
         .into_iter()
-        .map(|(cidr, (kind, x0, y0, x1, y1))| {
+        .map(|(cidr, (kind, (x0, y0, x1, y1)))| {
             // A label band on top.
             let (x, y) = (x0 - HULL_PAD, y0 - HULL_PAD - HULL_LABEL);
             (
                 format!("{cidr} · {kind}"),
                 x,
                 y,
-                x1 - x0 + 2.0 * HULL_PAD,
-                y1 - y0 + 2.0 * HULL_PAD + HULL_LABEL,
+                2.0f64.mul_add(HULL_PAD, x1 - x0),
+                2.0f64.mul_add(HULL_PAD, y1 - y0) + HULL_LABEL,
             )
         })
         .collect()
 }
 
-#[component]
-pub fn GraphPage(
+/// Copyable handles that the graph page's handlers and views share.
+#[derive(Clone, Copy)]
+struct Page {
     graph: RwSignal<Graph>,
-    active: Signal<bool>,
     /// Registration data of host names, for the recent-domain mark.
     domains: RwSignal<Domains>,
     ptrs: RwSignal<Ptrs>,
-) -> impl IntoView {
-    let flagged = move |i: usize| {
-        let name = graph.with(|g| g.nodes.get(i).and_then(|n| n.name.clone()));
-        name.is_some_and(|n| domains.with(|d| d.get(&n).and_then(|d| d.flag()).is_some()))
-    };
-    let sim = StoredValue::new(Sim::default());
-    let frame = RwSignal::new(0_u64);
-    let layout = Layout {
-        graph,
-        sim,
-        frame,
-        active,
-    };
-    let camera = RwSignal::new(Camera {
-        x: 0.0,
-        y: 0.0,
-        k: 1.0,
-    });
-    let selected = RwSignal::new(None::<usize>);
-    // Node under the pointer and the pointer, for the hover card.
-    let hover = RwSignal::new(None::<usize>);
-    let cursor = RwSignal::new((0, 0));
-    let grab = StoredValue::new(None::<Grab>);
-    let svg = NodeRef::<Svg>::new();
-    let centered = StoredValue::new(false);
+    layout: Layout,
+    camera: RwSignal<Camera>,
+    selected: RwSignal<Option<usize>>,
+    /// Node under the pointer, and the pointer, for the hover card.
+    hover: RwSignal<Option<usize>>,
+    cursor: RwSignal<(i32, i32)>,
+    grab: StoredValue<Option<Grab>>,
+    svg: NodeRef<Svg>,
+    /// The selected node and its neighbors; other nodes are dimmed.
+    neighbors: Memo<Option<HashSet<usize>>>,
+}
 
-    let size = move || {
-        let r = svg.get_untracked()?.get_bounding_client_rect();
-        (r.width() > 0.0).then(|| (r.width(), r.height()))
+/// The network graph with its inspector and ontology. The layout runs only
+/// while `active`; `domains` holds registration data for the recent-domain mark.
+pub fn graph_page(
+    graph: RwSignal<Graph>,
+    active: Signal<bool>,
+    domains: RwSignal<Domains>,
+    ptrs: RwSignal<Ptrs>,
+) -> impl IntoView {
+    let selected = RwSignal::new(None::<usize>);
+    let page = Page {
+        graph,
+        domains,
+        ptrs,
+        layout: Layout {
+            graph,
+            sim: StoredValue::new(Sim::default()),
+            frame: RwSignal::new(0),
+            active,
+        },
+        camera: RwSignal::new(Camera {
+            x: 0.0,
+            y: 0.0,
+            k: 1.0,
+        }),
+        selected,
+        hover: RwSignal::new(None),
+        cursor: RwSignal::new((0, 0)),
+        grab: StoredValue::new(None),
+        svg: NodeRef::new(),
+        neighbors: Memo::new(move |_| {
+            let sel = selected.get()?;
+            Some(graph.with(|g| {
+                g.edges
+                    .iter()
+                    .filter_map(|e| match (e.from == sel, e.to == sel) {
+                        (true, _) => Some(e.to),
+                        (_, true) => Some(e.from),
+                        _ => None,
+                    })
+                    .chain([sel])
+                    .collect()
+            }))
+        }),
     };
-    let local = move |ev: &MouseEvent| {
-        let r = svg.get_untracked().map(|s| s.get_bounding_client_rect());
+    page.restart_on_change(active);
+    view! {
+        <div class="graph-page">
+            {page.canvas()}
+            {move || page.hover_tip()}
+            {page.side()}
+        </div>
+    }
+}
+
+/// Camera and layout control.
+impl Page {
+    /// Size of the drawing area in px, once it is laid out.
+    fn size(self) -> Option<(f64, f64)> {
+        let r = self.svg.get_untracked()?.get_bounding_client_rect();
+        (r.width() > 0.0).then(|| (r.width(), r.height()))
+    }
+
+    /// Position of a pointer event in the drawing area, in px.
+    fn local(self, ev: &MouseEvent) -> (f64, f64) {
+        let r = self
+            .svg
+            .get_untracked()
+            .map(|s| s.get_bounding_client_rect());
         let (left, top) = r.map_or((0.0, 0.0), |r| (r.left(), r.top()));
         (
             f64::from(ev.client_x()) - left,
             f64::from(ev.client_y()) - top,
         )
-    };
-    let center_on = move |i: usize| {
-        let (Some((w, h)), Some(b)) = (size(), sim.with_value(|s| s.bodies.get(i).copied())) else {
+    }
+
+    fn center_on(self, i: usize) {
+        let body = self.layout.sim.with_value(|s| s.bodies.get(i).copied());
+        let (Some((w, h)), Some(b)) = (self.size(), body) else {
             return;
         };
-        camera.update(|c| (c.x, c.y) = (w / 2.0 - b.x * c.k, h / 2.0 - b.y * c.k));
-    };
-    let fit = move || {
-        let Some((w, h)) = size() else { return };
-        let bounds = graph.with_untracked(|g| {
-            sim.with_value(|s| {
+        self.camera
+            .update(|c| (c.x, c.y) = (b.x.mul_add(-c.k, w / 2.0), b.y.mul_add(-c.k, h / 2.0)));
+    }
+
+    /// Zooms so every card shows.
+    fn fit(self) {
+        let Some((w, h)) = self.size() else { return };
+        let bounds = self.graph.with_untracked(|g| {
+            self.layout.sim.with_value(|s| {
                 g.nodes
                     .iter()
                     .zip(&s.bodies)
@@ -455,102 +547,195 @@ pub fn GraphPage(
         let k = ((w - pad) / (x1 - x0).max(1.0))
             .min((h - pad) / (y1 - y0).max(1.0))
             .clamp(ZOOM_MIN, 1.5);
-        camera.set(Camera {
+        self.camera.set(Camera {
             k,
-            x: w / 2.0 - (x0 + x1) / 2.0 * k,
-            y: h / 2.0 - (y0 + y1) / 2.0 * k,
+            x: f64::midpoint(x0, x1).mul_add(-k, w / 2.0),
+            y: f64::midpoint(y0, y1).mul_add(-k, h / 2.0),
         });
-    };
-    let zoom = move |(px, py): (f64, f64), factor: f64| {
-        camera.update(|c| {
+    }
+
+    /// Zooms by `factor` around the point `(px, py)` of the drawing area.
+    fn zoom(self, (px, py): (f64, f64), factor: f64) {
+        self.camera.update(|c| {
             let k = (c.k * factor).clamp(ZOOM_MIN, ZOOM_MAX);
             let r = k / c.k;
             *c = Camera {
-                x: px - (px - c.x) * r,
-                y: py - (py - c.y) * r,
+                x: (px - c.x).mul_add(-r, px),
+                y: (py - c.y).mul_add(-r, py),
                 k,
             };
         });
-    };
-    let zoom_center = move |factor: f64| {
-        if let Some((w, h)) = size() {
-            zoom((w / 2.0, h / 2.0), factor);
-        }
-    };
+    }
 
-    // New nodes or edges, or a shown tab, restart the layout.
-    let seen = StoredValue::new((0_usize, 0_usize));
-    Effect::new(move |_| {
-        let counts = graph.with(|g| (g.nodes.len(), g.edges.len()));
-        if !active.get() {
-            return;
+    fn zoom_center(self, factor: f64) {
+        if let Some((w, h)) = self.size() {
+            self.zoom((w / 2.0, h / 2.0), factor);
         }
-        if counts.0 < seen.get_value().0 {
-            // A new capture: forget the old layout.
-            selected.set(None);
-            sim.update_value(|s| s.bodies.clear());
-            centered.set_value(false);
-        }
-        seen.set_value(counts);
-        if !centered.get_value()
-            && let Some((w, h)) = size()
-        {
-            camera.set(Camera {
-                x: w / 2.0,
-                y: h / 2.0,
-                k: 1.0,
-            });
-            centered.set_value(true);
-        }
-        layout.kick(0.3);
-    });
+    }
 
-    let node_at = |ev: &MouseEvent| {
-        ev.target()
-            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
-            .and_then(|e| e.closest("[data-node]").ok().flatten())
-            .and_then(|e| e.get_attribute("data-node"))
-            .and_then(|v| v.parse::<usize>().ok())
-    };
-    let on_down = move |ev: PointerEvent| {
+    /// Restarts the layout on new nodes or edges, or when the tab shows.
+    fn restart_on_change(self, active: Signal<bool>) {
+        let seen = StoredValue::new((0_usize, 0_usize));
+        let centered = StoredValue::new(false);
+        Effect::new(move |_| {
+            let counts = self.graph.with(|g| (g.nodes.len(), g.edges.len()));
+            if !active.get() {
+                return;
+            }
+            if counts.0 < seen.get_value().0 {
+                // A new capture: forget the old layout.
+                self.selected.set(None);
+                self.layout.sim.update_value(|s| s.bodies.clear());
+                centered.set_value(false);
+            }
+            seen.set_value(counts);
+            if !centered.get_value()
+                && let Some((w, h)) = self.size()
+            {
+                self.camera.set(Camera {
+                    x: w / 2.0,
+                    y: h / 2.0,
+                    k: 1.0,
+                });
+                centered.set_value(true);
+            }
+            self.layout.kick(0.3);
+        });
+    }
+
+    /// Position of body `i` in world units; reactive to layout steps.
+    fn pos(self, i: usize) -> (f64, f64) {
+        self.layout.frame.track();
+        self.layout
+            .sim
+            .with_value(|s| s.bodies.get(i).map_or((0.0, 0.0), |b| (b.x, b.y)))
+    }
+
+    fn pinned(self, i: usize) -> bool {
+        self.layout.frame.track();
+        self.layout
+            .sim
+            .with_value(|s| s.bodies.get(i).is_some_and(|b| b.pinned))
+    }
+
+    fn set_pinned(self, i: usize, pinned: bool) {
+        self.layout.sim.update_value(|s| {
+            if let Some(b) = s.bodies.get_mut(i) {
+                b.pinned = pinned;
+            }
+        });
+    }
+
+    /// Unpins node `i` and lets it settle among its neighbors.
+    fn release(self, i: usize) {
+        self.set_pinned(i, false);
+        self.layout.kick(0.15);
+    }
+
+    /// Node `i` is not the selected node or one of its neighbors.
+    fn dim(self, i: usize) -> bool {
+        self.neighbors
+            .with(|n| n.as_ref().is_some_and(|n| !n.contains(&i)))
+    }
+
+    /// The host of node `i` has a recently registered or transferred domain.
+    fn flagged(self, i: usize) -> bool {
+        let name = self
+            .graph
+            .with(|g| g.nodes.get(i).and_then(|n| n.name.clone()));
+        name.is_some_and(|n| {
+            self.domains
+                .with(|d| d.get(&n).and_then(DomainInfo::flag).is_some())
+        })
+    }
+
+    /// What the node inspector's buttons do.
+    fn actions(self) -> Actions {
+        Actions {
+            select: Callback::new(move |i: usize| {
+                self.selected.set(Some(i));
+                self.center_on(i);
+            }),
+            center: Callback::new(move |()| {
+                if let Some(i) = self.selected.get_untracked() {
+                    self.center_on(i);
+                }
+            }),
+            pin: Callback::new(move |()| {
+                let Some(i) = self.selected.get_untracked() else {
+                    return;
+                };
+                if self.pinned(i) {
+                    self.release(i);
+                } else {
+                    self.set_pinned(i, true);
+                    self.layout.frame.update(|f| *f += 1);
+                }
+            }),
+        }
+    }
+}
+
+/// Index of the node a pointer event happened on.
+fn node_at(ev: &MouseEvent) -> Option<usize> {
+    ev.target()
+        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        .and_then(|e| e.closest("[data-node]").ok().flatten())
+        .and_then(|e| e.get_attribute("data-node"))
+        .and_then(|v| v.parse::<usize>().ok())
+}
+
+/// Pointer and keyboard handlers.
+impl Page {
+    fn on_down(self, ev: &PointerEvent) {
         if ev.button() != 0 {
             return;
         }
-        hover.set(None);
-        let from = local(&ev);
-        grab.set_value(Some(match node_at(&ev) {
-            Some(i) => Grab::Node {
+        self.hover.set(None);
+        let from = self.local(ev);
+        let grab = node_at(ev).map_or_else(
+            || Grab::Pan {
+                from,
+                start: self.camera.get_untracked(),
+                moved: false,
+            },
+            |i| Grab::Node {
                 i,
                 from,
                 moved: false,
             },
-            None => Grab::Pan {
-                from,
-                start: camera.get_untracked(),
-                moved: false,
-            },
-        }));
-        if let Some(el) = svg.get_untracked() {
+        );
+        self.grab.set_value(Some(grab));
+        if let Some(el) = self.svg.get_untracked() {
             // Keep receiving moves when the pointer leaves the graph.
             let _ = el.set_pointer_capture(ev.pointer_id());
         }
-    };
-    let on_move = move |ev: PointerEvent| {
-        let Some(g) = grab.get_value() else {
-            let i = node_at(&ev);
-            if hover.get_untracked() != i {
-                hover.set(i);
-            }
-            cursor.set((ev.client_x(), ev.client_y()));
-            return;
-        };
-        let p = local(&ev);
+    }
+
+    /// Tracks the hovered node, or drags what the pointer grabbed.
+    fn on_move(self, ev: &PointerEvent) {
+        self.grab
+            .get_value()
+            .map_or_else(|| self.track_hover(ev), |grab| self.drag(grab, ev));
+    }
+
+    fn track_hover(self, ev: &PointerEvent) {
+        let i = node_at(ev);
+        if self.hover.get_untracked() != i {
+            self.hover.set(i);
+        }
+        self.cursor.set((ev.client_x(), ev.client_y()));
+    }
+
+    /// Pans, or moves the grabbed node, once the pointer left `DRAG_SLOP`.
+    fn drag(self, grab: Grab, ev: &PointerEvent) {
+        let p = self.local(ev);
         let far = |from: (f64, f64)| (p.0 - from.0).hypot(p.1 - from.1) > DRAG_SLOP;
-        grab.set_value(Some(match g {
+        self.grab.set_value(Some(match grab {
             Grab::Pan { from, start, moved } => {
                 let moved = moved || far(from);
                 if moved {
-                    camera.set(Camera {
+                    self.camera.set(Camera {
                         x: start.x + p.0 - from.0,
                         y: start.y + p.1 - from.1,
                         k: start.k,
@@ -561,36 +746,45 @@ pub fn GraphPage(
             Grab::Node { i, from, moved } => {
                 let moved = moved || far(from);
                 if moved {
-                    let c = camera.get_untracked();
-                    sim.update_value(|s| {
-                        if let Some(b) = s.bodies.get_mut(i) {
-                            // A pinned node stays pinned at its new place.
-                            *b = Body {
-                                x: (p.0 - c.x) / c.k,
-                                y: (p.1 - c.y) / c.k,
-                                pinned: b.pinned,
-                                ..Body::default()
-                            };
-                        }
-                        s.held = Some(i);
-                        s.target = 0.3;
-                    });
-                    layout.kick(0.3);
+                    self.drag_to(i, p);
                 }
                 Grab::Node { i, from, moved }
             }
         }));
-    };
-    let on_up = move |_: PointerEvent| {
-        let Some(g) = grab.get_value() else { return };
-        grab.set_value(None);
-        sim.update_value(|s| {
+    }
+
+    /// Holds node `i` under the drawing-area point `p` while the layout runs.
+    fn drag_to(self, i: usize, p: (f64, f64)) {
+        let c = self.camera.get_untracked();
+        self.layout.sim.update_value(|s| {
+            if let Some(b) = s.bodies.get_mut(i) {
+                // A pinned node stays pinned at its new place.
+                *b = Body {
+                    x: (p.0 - c.x) / c.k,
+                    y: (p.1 - c.y) / c.k,
+                    pinned: b.pinned,
+                    ..Body::default()
+                };
+            }
+            s.held = Some(i);
+            s.target = 0.3;
+        });
+        self.layout.kick(0.3);
+    }
+
+    fn on_up(self) {
+        let Some(grab) = self.grab.get_value() else {
+            return;
+        };
+        self.grab.set_value(None);
+        self.layout.sim.update_value(|s| {
             s.target = 0.0;
             s.held = None;
         });
         // Let the released node settle among its neighbors.
-        layout.kick(0.15);
-        match g {
+        self.layout.kick(0.15);
+        let selected = self.selected;
+        match grab {
             // A click: inspect the node, or close the inspector when it is open on it.
             Grab::Node {
                 i, moved: false, ..
@@ -598,240 +792,224 @@ pub fn GraphPage(
             Grab::Pan { moved: false, .. } => selected.set(None),
             _ => {}
         }
-    };
-    let release = move |i: usize| {
-        sim.update_value(|s| {
-            if let Some(b) = s.bodies.get_mut(i) {
-                b.pinned = false;
-            }
-        });
-        layout.kick(0.15);
-    };
-    let on_wheel = move |ev: WheelEvent| {
+    }
+
+    fn on_wheel(self, ev: &WheelEvent) {
         ev.prevent_default();
         // Line mode (1) reports lines; count a line as 16px.
         let dy = ev.delta_y() * if ev.delta_mode() == 1 { 16.0 } else { 1.0 };
-        zoom(local(&ev), (-dy * 0.0015).exp());
-    };
-    let on_key = move |ev: KeyboardEvent| match ev.key().as_str() {
-        "+" | "=" => zoom_center(1.25),
-        "-" => zoom_center(0.8),
-        "0" => fit(),
-        "Escape" => selected.set(None),
-        _ => {}
-    };
+        self.zoom(self.local(ev), (-dy * 0.0015).exp());
+    }
 
-    let pos = move |i: usize| {
-        frame.track();
-        sim.with_value(|s| s.bodies.get(i).map_or((0.0, 0.0), |b| (b.x, b.y)))
-    };
-    let pinned = move |i: usize| {
-        frame.track();
-        sim.with_value(|s| s.bodies.get(i).is_some_and(|b| b.pinned))
-    };
-    let neighbors = Memo::new(move |_| {
-        let sel = selected.get()?;
-        Some(graph.with(|g| {
-            g.edges
-                .iter()
-                .filter_map(|e| match (e.from == sel, e.to == sel) {
-                    (true, _) => Some(e.to),
-                    (_, true) => Some(e.from),
-                    _ => None,
-                })
-                .chain([sel])
-                .collect::<HashSet<usize>>()
-        }))
-    });
-    let dim = move |i: usize| neighbors.with(|n| n.as_ref().is_some_and(|n| !n.contains(&i)));
-    let select_and_center = move |i: usize| {
-        selected.set(Some(i));
-        center_on(i);
-    };
+    fn on_key(self, ev: &KeyboardEvent) {
+        match ev.key().as_str() {
+            "+" | "=" => self.zoom_center(1.25),
+            "-" => self.zoom_center(0.8),
+            "0" => self.fit(),
+            "Escape" => self.selected.set(None),
+            _ => {}
+        }
+    }
+}
 
-    view! {
-        <div class="graph-page">
+/// Views of the page's parts.
+impl Page {
+    /// The drawing area with its tools.
+    fn canvas(self) -> impl IntoView {
+        let camera = self.camera;
+        view! {
             <div class="graph-canvas">
                 <svg
-                    node_ref=svg
+                    node_ref=self.svg
                     class="graph-svg"
                     tabindex="0"
                     role="img"
                     aria-label="Capture graph. Drag to move, scroll or plus and minus keys to zoom, 0 to fit."
-                    on:pointerdown=on_down
-                    on:pointermove=on_move
-                    on:pointerup=on_up
-                    on:pointercancel=on_up
-                    on:pointerleave=move |_| hover.set(None)
+                    on:pointerdown=move |ev| self.on_down(&ev)
+                    on:pointermove=move |ev| self.on_move(&ev)
+                    on:pointerup=move |_| self.on_up()
+                    on:pointercancel=move |_| self.on_up()
+                    on:pointerleave=move |_| self.hover.set(None)
                     on:dblclick=move |ev| {
                         if let Some(i) = node_at(&ev) {
-                            release(i);
+                            self.release(i);
                         }
                     }
-                    on:wheel=on_wheel
-                    on:keydown=on_key
+                    on:wheel=move |ev| self.on_wheel(&ev)
+                    on:keydown=move |ev| self.on_key(&ev)
                 >
                     <g transform=move || {
                         let c = camera.get();
                         format!("translate({:.1},{:.1}) scale({:.4})", c.x, c.y, c.k)
                     }>
-                        <g class="hulls">
-                            {move || {
-                                frame.track();
-                                graph
-                                    .with(|g| sim.with_value(|s| hulls(g, &s.bodies)))
-                                    .into_iter()
-                                    .map(|(label, x, y, w, h)| {
-                                        view! {
-                                            <g class="hull">
-                                                <rect x=x y=y width=w height=h rx="18" />
-                                                <text x={x + 14.0} y={y + 18.0}>
-                                                    {label}
-                                                </text>
-                                            </g>
-                                        }
-                                    })
-                                    .collect_view()
-                            }}
-                        </g>
-                        <g class="edges">
-                            <For
-                                each=move || graph.with(|g| 0..g.edges.len())
-                                key=|i| *i
-                                children=move |i| {
-                                    let (from, to, rel) = graph
-                                        .with_untracked(|g| {
-                                            let e = &g.edges[i];
-                                            (e.from, e.to, e.rel)
-                                        });
-                                    let width = move || {
-                                        graph
-                                            .with(|g| {
-                                                g.edges
-                                                    .get(i)
-                                                    .map_or(
-                                                        1.0,
-                                                        |e| 1.0 + (e.packets as f64).log2().clamp(0.0, 8.0) / 2.0,
-                                                    )
-                                            })
-                                    };
-                                    let dim_edge = move || selected.get().is_some_and(|s| s != from && s != to);
-                                    let mid = move || {
-                                        let (a, b) = (pos(from), pos(to));
-                                        ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0)
-                                    };
-                                    let label = move || graph.with(|g| g.edges.get(i).map(|e| edge_label(&e.protos)));
-                                    view! {
-                                        <line
-                                            class="edge"
-                                            data-rel=rel_attr(rel)
-                                            class:dim=dim_edge
-                                            x1=move || pos(from).0
-                                            y1=move || pos(from).1
-                                            x2=move || pos(to).0
-                                            y2=move || pos(to).1
-                                            stroke-width=width
-                                        />
-                                        <text
-                                            class="edge-label"
-                                            class:dim=dim_edge
-                                            x=move || mid().0
-                                            y=move || mid().1 + 4.0
-                                            text-anchor="middle"
-                                        >
-                                            {label}
-                                        </text>
-                                    }
-                                }
-                            />
-                        </g>
-                        <g class="nodes">
-                            <For
-                                each=move || graph.with(|g| 0..g.nodes.len())
-                                key=|i| *i
-                                children=move |i| {
-                                    view! {
-                                        <g
-                                            class="node node-card"
-                                            data-node=i
-                                            transform=move || {
-                                                let (x, y) = pos(i);
-                                                format!("translate({x:.1},{y:.1})")
-                                            }
-                                            class:dim=move || dim(i)
-                                            class:selected=move || selected.get() == Some(i)
-                                            class:pinned=move || pinned(i)
-                                            class:flagged=move || flagged(i)
-                                        >
-                                            {node_card_view(graph, ptrs, i)}
-                                        </g>
-                                    }
-                                }
-                            />
-                        </g>
+                        <g class="hulls">{move || self.hulls_view()}</g>
+                        <g class="edges">{self.edges_view()}</g>
+                        <g class="nodes">{self.nodes_view()}</g>
                     </g>
                 </svg>
-                <Show when=move || graph.with(|g| g.nodes.is_empty())>
+                <Show when=move || self.graph.with(|g| g.nodes.is_empty())>
                     <p class="graph-empty">"The graph builds itself as packets arrive."</p>
                 </Show>
-                <div class="graph-tools">
-                    <button class="btn btn-secondary btn-sm" aria-label="Zoom in" on:click=move |_| zoom_center(1.25)>
-                        "+"
-                    </button>
-                    <button class="btn btn-secondary btn-sm" aria-label="Zoom out" on:click=move |_| zoom_center(0.8)>
-                        "−"
-                    </button>
-                    <button class="btn btn-secondary btn-sm" on:click=move |_| fit()>
-                        "Fit"
-                    </button>
-                    <span class="zoom-level">{move || format!("{:.0}%", camera.get().k * 100.0)}</span>
-                </div>
+                {self.tools()}
                 <p class="graph-hint">
                     "Drag a node to move it. Click it to inspect it; Pin there keeps it in place, double-click releases it. Drag the background to pan, scroll to zoom."
                 </p>
             </div>
-            {move || {
-                let i = hover.get()?;
-                let (title, list, flag) = graph
-                    .with(|g| ptrs.with(|p| domains.with(|d| node_card(g, i, p, d))))?;
-                Some(view! {
-                    <Tip cursor>
-                        <h4>{title}</h4>
-                        {flag.map(|why| view! { <p class="tip-flag">{why}</p> })}
-                        {facts("tip-grid", list)}
-                        <p class="tip-hint">"Click to inspect"</p>
-                    </Tip>
+        }
+    }
+
+    /// Frames of the address blocks, labelled with their CIDR.
+    fn hulls_view(self) -> impl IntoView {
+        self.layout.frame.track();
+        self.graph
+            .with(|g| self.layout.sim.with_value(|s| hulls(g, &s.bodies)))
+            .into_iter()
+            .map(|(label, x, y, w, h)| {
+                view! {
+                    <g class="hull">
+                        <rect x=x y=y width=w height=h rx="18" />
+                        <text x={x + 14.0} y={y + 18.0}>
+                            {label}
+                        </text>
+                    </g>
+                }
+            })
+            .collect_view()
+    }
+
+    /// One line per edge, as wide as its traffic, named with its services.
+    fn edges_view(self) -> impl IntoView {
+        let graph = self.graph;
+        view! {
+            <For
+                each=move || graph.with(|g| 0..g.edges.len())
+                key=|i| *i
+                children=move |i| self.edge_view(i)
+            />
+        }
+    }
+
+    fn edge_view(self, i: usize) -> Option<impl IntoView> {
+        let graph = self.graph;
+        let (from, to, rel) =
+            graph.with_untracked(|g| g.edges.get(i).map(|e| (e.from, e.to, e.rel)))?;
+        let width = move || {
+            graph.with(|g| {
+                g.edges.get(i).map_or(1.0, |e| {
+                    1.0 + (e.packets as f64).log2().clamp(0.0, 8.0) / 2.0
                 })
-            }}
+            })
+        };
+        let dim_edge = move || self.selected.get().is_some_and(|s| s != from && s != to);
+        let mid = move || {
+            let (a, b) = (self.pos(from), self.pos(to));
+            (f64::midpoint(a.0, b.0), f64::midpoint(a.1, b.1))
+        };
+        let label = move || graph.with(|g| g.edges.get(i).map(|e| edge_label(&e.protos)));
+        Some(view! {
+            <line
+                class="edge"
+                data-rel=rel_attr(rel)
+                class:dim=dim_edge
+                x1=move || self.pos(from).0
+                y1=move || self.pos(from).1
+                x2=move || self.pos(to).0
+                y2=move || self.pos(to).1
+                stroke-width=width
+            />
+            <text
+                class="edge-label"
+                class:dim=dim_edge
+                x=move || mid().0
+                y=move || mid().1 + 4.0
+                text-anchor="middle"
+            >
+                {label}
+            </text>
+        })
+    }
+
+    /// One card per host, at its place in the layout.
+    fn nodes_view(self) -> impl IntoView {
+        let graph = self.graph;
+        view! {
+            <For
+                each=move || graph.with(|g| 0..g.nodes.len())
+                key=|i| *i
+                children=move |i| {
+                    view! {
+                        <g
+                            class="node node-card"
+                            data-node=i
+                            transform=move || {
+                                let (x, y) = self.pos(i);
+                                format!("translate({x:.1},{y:.1})")
+                            }
+                            class:dim=move || self.dim(i)
+                            class:selected=move || self.selected.get() == Some(i)
+                            class:pinned=move || self.pinned(i)
+                            class:flagged=move || self.flagged(i)
+                        >
+                            {node_card_view(graph, self.ptrs, i)}
+                        </g>
+                    }
+                }
+            />
+        }
+    }
+
+    /// Zoom buttons and the zoom level.
+    fn tools(self) -> impl IntoView {
+        view! {
+            <div class="graph-tools">
+                <button class="btn btn-secondary btn-sm" aria-label="Zoom in" on:click=move |_| self.zoom_center(1.25)>
+                    "+"
+                </button>
+                <button class="btn btn-secondary btn-sm" aria-label="Zoom out" on:click=move |_| self.zoom_center(0.8)>
+                    "−"
+                </button>
+                <button class="btn btn-secondary btn-sm" on:click=move |_| self.fit()>
+                    "Fit"
+                </button>
+                <span class="zoom-level">{move || format!("{:.0}%", self.camera.get().k * 100.0)}</span>
+            </div>
+        }
+    }
+
+    /// Hover card of the node under the pointer.
+    fn hover_tip(self) -> Option<impl IntoView + use<>> {
+        let i = self.hover.get()?;
+        let (title, list, flag) = self.graph.with(|g| {
+            self.ptrs
+                .with(|p| self.domains.with(|d| node_card(g, i, p, d)))
+        })?;
+        Some(tip(
+            self.cursor,
+            view! {
+                <h4>{title}</h4>
+                {flag.map(|why| view! { <p class="tip-flag">{why}</p> })}
+                {facts("tip-grid", list)}
+                <p class="tip-hint">"Click to inspect"</p>
+            },
+        ))
+    }
+
+    /// Node inspector, ontology and build log.
+    fn side(self) -> impl IntoView {
+        let (graph, selected) = (self.graph, self.selected);
+        let actions = self.actions();
+        view! {
             <aside class="graph-side">
                 // The inspector comes first: it answers the click the user just made.
                 <Show when=move || selected.get().is_some()>
-                    <Inspector
-                        graph
-                        domains
-                        ptrs
-                        selected
-                        pinned=Signal::derive(move || selected.get().is_some_and(pinned))
-                        on_select=Callback::new(select_and_center)
-                        on_center=Callback::new(move |()| {
-                            if let Some(i) = selected.get_untracked() {
-                                center_on(i);
-                            }
-                        })
-                        on_pin=Callback::new(move |()| {
-                            let Some(i) = selected.get_untracked() else { return };
-                            if pinned(i) {
-                                release(i);
-                            } else {
-                                sim.update_value(|s| {
-                                    if let Some(b) = s.bodies.get_mut(i) {
-                                        b.pinned = true;
-                                    }
-                                });
-                                frame.update(|f| *f += 1);
-                            }
-                        })
-                    />
+                    {node_inspector(
+                        graph,
+                        self.domains,
+                        self.ptrs,
+                        selected,
+                        Signal::derive(move || selected.get().is_some_and(|i| self.pinned(i))),
+                        actions,
+                    )}
                 </Show>
                 <section class="ontology" aria-label="Ontology">
                     <h3>"Ontology"</h3>
@@ -851,7 +1029,7 @@ pub fn GraphPage(
                             let node = entry.node;
                             view! {
                                 <li class="list-item">
-                                    <button type="button" class="log-entry" on:click=move |_| select_and_center(node)>
+                                    <button type="button" class="log-entry" on:click=move |_| actions.select.run(node)>
                                         <time>{entry.time}</time>
                                         <span>{entry.text}</span>
                                     </button>
@@ -861,11 +1039,11 @@ pub fn GraphPage(
                     />
                 </ol>
             </aside>
-        </div>
+        }
     }
 }
 
-fn rel_attr(rel: Rel) -> &'static str {
+const fn rel_attr(rel: Rel) -> &'static str {
     match rel {
         Rel::Connects => "connects",
         Rel::Exchanges => "direct",
@@ -897,7 +1075,7 @@ fn node_card_view(graph: RwSignal<Graph>, ptrs: RwSignal<Ptrs>, i: usize) -> imp
                 .into_iter()
                 .enumerate()
                 .map(|(row, (class, text, count))| {
-                    let y = top + CARD_TITLE + 6.0 + CARD_LINE * (row as f64 + 0.75);
+                    let y = CARD_LINE.mul_add(row as f64 + 0.75, top + CARD_TITLE + 6.0);
                     view! {
                         <text class=class x=x0 + CARD_PAD + 2.0 y=y>
                             {text}
@@ -949,9 +1127,10 @@ fn node_facts(g: &Graph, i: usize, ptrs: &Ptrs, domains: &Domains) -> Vec<(&'sta
     if let Some(e) = g.log.iter().find(|e| e.node == i) {
         list.push(("First seen", format!("{} s", e.time)));
     }
-    let block = n
-        .scope
-        .map_or("public".to_owned(), |s| format!("{} · {}", s.cidr, s.kind));
+    let block = n.scope.map_or_else(
+        || "public".to_owned(),
+        |s| format!("{} · {}", s.cidr, s.kind),
+    );
     list.push(("Address", block));
     if let Some(p) = ptr_of(ptrs, &n.label) {
         list.push(("PTR", p.to_owned()));
@@ -970,10 +1149,10 @@ fn node_facts(g: &Graph, i: usize, ptrs: &Ptrs, domains: &Domains) -> Vec<(&'sta
 /// Title, facts and recent-domain warning of the hover card for node `i`.
 fn node_card(g: &Graph, i: usize, ptrs: &Ptrs, domains: &Domains) -> Option<Card> {
     let n = g.nodes.get(i)?;
-    let title = match &n.name {
-        Some(name) => format!("{name} ({})", n.label),
-        None => n.label.clone(),
-    };
+    let title = n
+        .name
+        .as_ref()
+        .map_or_else(|| n.label.clone(), |name| format!("{name} ({})", n.label));
     let flag = n
         .name
         .as_ref()
@@ -984,16 +1163,25 @@ fn node_card(g: &Graph, i: usize, ptrs: &Ptrs, domains: &Domains) -> Option<Card
     Some((title, list, flag))
 }
 
-#[component]
-fn Inspector(
+/// What the node inspector's buttons do.
+#[derive(Clone, Copy, Debug)]
+struct Actions {
+    /// Selects another node, by index.
+    select: Callback<usize>,
+    /// Centers the view on the selected node.
+    center: Callback<()>,
+    /// Pins the selected node, or releases it when `pinned`.
+    pin: Callback<()>,
+}
+
+/// Facts and relations of the selected node, with its buttons.
+fn node_inspector(
     graph: RwSignal<Graph>,
     domains: RwSignal<Domains>,
     ptrs: RwSignal<Ptrs>,
     selected: RwSignal<Option<usize>>,
     pinned: Signal<bool>,
-    on_select: Callback<usize>,
-    on_center: Callback<()>,
-    on_pin: Callback<()>,
+    actions: Actions,
 ) -> impl IntoView {
     let node = move || {
         selected
@@ -1075,7 +1263,7 @@ fn Inspector(
                         view! {
                             <li>
                                 <span class="rel">{text}</span>
-                                <button type="button" class="link" on:click=move |_| on_select.run(other)>
+                                <button type="button" class="link" on:click=move |_| actions.select.run(other)>
                                     {label}
                                 </button>
                                 <span class="num">{count}</span>
@@ -1085,10 +1273,10 @@ fn Inspector(
                 />
             </ul>
             <div class="inspector-actions">
-                <button type="button" class="btn btn-secondary btn-sm" on:click=move |_| on_center.run(())>
+                <button type="button" class="btn btn-secondary btn-sm" on:click=move |_| actions.center.run(())>
                     "Center"
                 </button>
-                <button type="button" class="btn btn-secondary btn-sm" on:click=move |_| on_pin.run(())>
+                <button type="button" class="btn btn-secondary btn-sm" on:click=move |_| actions.pin.run(())>
                     {move || if pinned.get() { "Release" } else { "Pin" }}
                 </button>
             </div>

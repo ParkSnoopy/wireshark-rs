@@ -1,14 +1,16 @@
-//! Unprivileged desktop shell: hosts the Leptos UI in a WebKitGTK webview.
+//! Unprivileged desktop shell: hosts the Leptos UI in a `WebKitGTK` webview.
 //!
 //! At launch it asks pkexec once for a packet socket (see `helper`). Start
-//! and Stop then only bind and unbind that socket: no prompt, no root. The
-//! same helper sets up HTTPS interception when the user turns it on.
+//! and Stop then only swap that socket's packet filter: no prompt, no root.
+//! The same helper sets up HTTPS interception when the user turns it on.
 
 mod capture;
 mod export;
 mod helper;
-// Shared with the helper binary, which uses the parts this one does not.
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "shared with the helper binary, which uses the parts this one does not"
+)]
 mod helper_proto;
 mod l7;
 mod mitm;
@@ -20,7 +22,8 @@ mod rdap;
 mod stream;
 
 use std::borrow::Cow;
-use std::io;
+use std::error::Error;
+use std::io::{self, Write};
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::Arc;
@@ -32,7 +35,8 @@ use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::platform::unix::WindowExtUnix;
 use tao::window::WindowBuilder;
-use wry::http::{Response, header::CONTENT_TYPE};
+use wry::http::header::{CONTENT_TYPE, HeaderValue};
+use wry::http::{Response, StatusCode};
 use wry::{WebView, WebViewBuilder, WebViewBuilderExtUnix};
 
 use capture::Capture;
@@ -111,13 +115,12 @@ struct App {
     status: Status,
 }
 
-fn main() -> wry::Result<()> {
+fn main() -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let window = WindowBuilder::new()
         .with_title("wireshark-rs")
         .with_inner_size(LogicalSize::new(1200.0, 780.0))
-        .build(&event_loop)
-        .expect("create window");
+        .build(&event_loop)?;
 
     // The only privileged step: one prompt at launch, answered on a thread.
     let proxy = event_loop.create_proxy();
@@ -126,7 +129,10 @@ fn main() -> wry::Result<()> {
         let _ = proxy.send_event(UserEvent::Socket(helper::launch()));
     });
 
-    let ifaces = serde_json::to_string(&interfaces()?).expect("string list serializes");
+    let ifaces = serde_json::to_string(&interfaces()?)?;
+    let vbox = window
+        .default_vbox()
+        .ok_or("the window has no box to hold the webview")?;
     let proxy = event_loop.create_proxy();
     let webview = WebViewBuilder::new()
         .with_custom_protocol("app".into(), |_, req| asset(req.uri().path()))
@@ -138,7 +144,7 @@ fn main() -> wry::Result<()> {
         })
         .with_initialization_script(format!("window.IFACES = () => {ifaces};"))
         .with_url(ORIGIN)
-        .build_gtk(window.default_vbox().expect("tao creates a default vbox"))?;
+        .build_gtk(vbox)?;
 
     let rdap = {
         let proxy = event_loop.create_proxy();
@@ -202,7 +208,7 @@ fn main() -> wry::Result<()> {
                 if app.mitm.take().is_some()
                     && let Some(Err(e)) = app.helper.as_ref().map(|h| h.intercept_off())
                 {
-                    eprintln!("cannot undo interception: {e}");
+                    let _ = writeln!(io::stderr(), "cannot undo interception: {e}");
                 }
                 app.helper = None;
                 *control_flow = ControlFlow::Exit;
@@ -383,7 +389,7 @@ impl App {
         // The UI names the file; keep only a plain file name as the suggestion.
         let name = Path::new(name)
             .file_name()
-            .map_or("export.txt".into(), |n| n.to_string_lossy().into_owned());
+            .map_or_else(|| "export.txt".into(), |n| n.to_string_lossy().into_owned());
         self.ask_path("Export packets", &name, move |path| {
             std::fs::write(path, &body).map(|()| format!("saved {}", path.display()))
         });
@@ -418,12 +424,18 @@ impl App {
 
 /// Sends `payload` to the UI as a `CustomEvent` whose `detail` is a JSON string.
 fn emit<T: serde::Serialize + ?Sized>(webview: &WebView, name: &str, payload: &T) {
-    let json = serde_json::to_string(payload).expect("payload serializes");
-    let literal = serde_json::to_string(&json).expect("string serializes");
-    let script =
-        format!("window.dispatchEvent(new CustomEvent({name:?}, {{ detail: {literal} }}));");
-    if let Err(e) = webview.evaluate_script(&script) {
-        eprintln!("evaluate_script: {e}");
+    // The JSON text is passed as a JS string literal, itself written as JSON.
+    let script = serde_json::to_string(payload)
+        .and_then(|json| serde_json::to_string(&json))
+        .map(|literal| {
+            format!("window.dispatchEvent(new CustomEvent({name:?}, {{ detail: {literal} }}));")
+        });
+    let sent = match script {
+        Ok(script) => webview.evaluate_script(&script).map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    if let Err(e) = sent {
+        let _ = writeln!(io::stderr(), "cannot send {name} to the UI: {e}");
     }
 }
 
@@ -446,10 +458,13 @@ fn asset(path: &str) -> Response<Cow<'static, [u8]>> {
         Some("woff2") => "font/woff2",
         _ => "text/plain",
     };
-    let (status, body) = found.map_or((404, &[][..]), |(_, body)| (200, *body));
-    Response::builder()
-        .status(status)
-        .header(CONTENT_TYPE, mime)
-        .body(Cow::Borrowed(body))
-        .expect("static response is valid")
+    let (status, body) = found.map_or((StatusCode::NOT_FOUND, &[][..]), |(_, body)| {
+        (StatusCode::OK, *body)
+    });
+    let mut response = Response::new(Cow::Borrowed(body));
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(mime));
+    response
 }

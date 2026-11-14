@@ -13,13 +13,30 @@ use std::sync::{Mutex, PoisonError};
 
 use gtk::prelude::*;
 
-/// pcap link type LINUX_SLL: a 16-byte pseudo header built from `sockaddr_ll`.
+/// pcap link type `LINUX_SLL`: a 16-byte pseudo header built from `sockaddr_ll`.
 const LINKTYPE_LINUX_SLL: u32 = 113;
 /// Largest packet kept, also the receive buffer size. Offloaded (GSO/GRO)
 /// packets can be far larger than the MTU.
 pub const SNAPLEN: usize = 262_144;
 const SLL_HEADER: usize = 16;
 
+/// Link-layer facts of one packet, as the packet socket reports them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Link {
+    /// `PACKET_HOST`, `PACKET_OUTGOING` and so on.
+    pub pkttype: u8,
+    /// ARP hardware type (`ARPHRD_*`).
+    pub hatype: u16,
+    /// Bytes of `addr` in use.
+    pub halen: u8,
+    /// Link-layer source address.
+    pub addr: [u8; 8],
+    /// Ethertype, in host byte order.
+    pub protocol: u16,
+}
+
+/// The pcap file that records every packet of one capture.
+#[derive(Debug)]
 pub struct Recording {
     path: PathBuf,
     out: Mutex<BufWriter<File>>,
@@ -53,13 +70,7 @@ impl Recording {
     }
 
     /// Appends one packet: `data` is what was captured, `wire_len` its length on the wire.
-    pub fn write(
-        &self,
-        ts_us: u64,
-        addr: &libc::sockaddr_ll,
-        data: &[u8],
-        wire_len: usize,
-    ) -> io::Result<()> {
+    pub fn write(&self, ts_us: u64, link: &Link, data: &[u8], wire_len: usize) -> io::Result<()> {
         let len = |n: usize| u32::try_from(n + SLL_HEADER).unwrap_or(u32::MAX);
         let secs = u32::try_from(ts_us / 1_000_000).unwrap_or(u32::MAX);
         let micros = u32::try_from(ts_us % 1_000_000).unwrap_or(0);
@@ -67,12 +78,12 @@ impl Recording {
         for word in [secs, micros, len(data.len()), len(wire_len)] {
             out.write_all(&word.to_le_bytes())?;
         }
-        // LINUX_SLL fields are big-endian; sll_protocol is already in network order.
-        out.write_all(&u16::from(addr.sll_pkttype).to_be_bytes())?;
-        out.write_all(&addr.sll_hatype.to_be_bytes())?;
-        out.write_all(&u16::from(addr.sll_halen).to_be_bytes())?;
-        out.write_all(&addr.sll_addr)?;
-        out.write_all(&addr.sll_protocol.to_ne_bytes())?;
+        // LINUX_SLL fields are big-endian.
+        out.write_all(&u16::from(link.pkttype).to_be_bytes())?;
+        out.write_all(&link.hatype.to_be_bytes())?;
+        out.write_all(&u16::from(link.halen).to_be_bytes())?;
+        out.write_all(&link.addr)?;
+        out.write_all(&link.protocol.to_be_bytes())?;
         out.write_all(data)
     }
 
@@ -174,38 +185,66 @@ pub fn ask_path(
 mod tests {
     use super::*;
 
-    #[test]
-    fn pcap_layout() {
-        let rec = Recording::create().expect("cache dir is writable");
-        // SAFETY: sockaddr_ll is a plain C struct; all-zero is a valid value.
-        let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
-        addr.sll_pkttype = 4; // outgoing
-        addr.sll_hatype = 772; // loopback
-        addr.sll_protocol = 0x0800_u16.to_be();
-        rec.write(1_500_000, &addr, &[0x45, 0, 0, 20], 60).unwrap();
+    /// What one recorded packet leaves behind.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Recorded {
+        /// The saved pcap file.
+        file: Vec<u8>,
+        /// What `scan` reports: number, ethertype, network-layer bytes.
+        seen: Vec<(u64, u16, Vec<u8>)>,
+        /// Whether the recording file outlives the `Recording`.
+        kept: bool,
+    }
+
+    /// Records one `IPv4` packet, saves the capture and scans it.
+    fn record_one() -> io::Result<Recorded> {
+        let rec = Recording::create()?;
+        let link = Link {
+            pkttype: 4,  // outgoing
+            hatype: 772, // loopback
+            protocol: 0x0800,
+            ..Link::default()
+        };
+        rec.write(1_500_000, &link, &[0x45, 0, 0, 20], 60)?;
         let dir = std::env::temp_dir().join(format!("wsrk-test-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&dir)?;
         let dest = dir.join("out.pcap");
-        assert_eq!(rec.save_to(&dest).unwrap(), 24 + 16 + 16 + 4);
-        let b = fs::read(&dest).unwrap();
-        assert_eq!(b[..4], [0xd4, 0xc3, 0xb2, 0xa1]);
-        assert_eq!(b[20..24], 113_u32.to_le_bytes());
-        // Record header: 1 s, 500000 µs, caplen 20, wire length 76.
-        assert_eq!(
-            b[24..40],
-            [1, 0, 0, 0, 0x20, 0xa1, 7, 0, 20, 0, 0, 0, 76, 0, 0, 0]
-        );
-        assert_eq!(b[40..56], [0, 4, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0]);
+        rec.save_to(&dest)?;
+        let file = fs::read(&dest)?;
+        fs::remove_dir_all(dir)?;
         let mut seen = Vec::new();
         rec.scan(|no, ethertype, d| {
             seen.push((no, ethertype, d.to_vec()));
             ControlFlow::Continue(())
-        })
-        .unwrap();
-        assert_eq!(seen, [(1, 0x0800, vec![0x45, 0, 0, 20])]);
+        })?;
         let path = rec.path.clone();
         drop(rec);
-        assert!(!path.exists());
-        fs::remove_dir_all(dir).unwrap();
+        Ok(Recorded {
+            file,
+            seen,
+            kept: path.exists(),
+        })
+    }
+
+    #[test]
+    fn pcap_layout() {
+        let file = [
+            // Magic, version 2.4, zone, sigfigs.
+            &[0xd4, 0xc3, 0xb2, 0xa1, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0][..],
+            // Snap length 262144 + 16, link type 113.
+            &[0x10, 0, 4, 0, 113, 0, 0, 0],
+            // Record header: 1 s, 500000 µs, caplen 20, wire length 76.
+            &[1, 0, 0, 0, 0x20, 0xa1, 7, 0, 20, 0, 0, 0, 76, 0, 0, 0],
+            // Link header: outgoing, loopback, no address, IPv4.
+            &[0, 4, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0],
+            &[0x45, 0, 0, 20],
+        ]
+        .concat();
+        let expected = Recorded {
+            file,
+            seen: vec![(1, 0x0800, vec![0x45, 0, 0, 20])],
+            kept: false,
+        };
+        assert_eq!(record_one().map_err(|e| e.to_string()), Ok(expected));
     }
 }

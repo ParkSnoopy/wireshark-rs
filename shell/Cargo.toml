@@ -2,19 +2,31 @@
 name = "wireshark-rs"
 version = "0.1.0"
 edition = "2024"
+description = "Live traffic supervisor for Linux with a webview UI"
+# An application, not a library: never published to crates.io.
+publish = false
 # src/bin/wireshark-capture.rs is the privileged helper, a separate binary.
 default-run = "wireshark-rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 brotli-decompressor = "6.3.1"
+# Safe getnameinfo for PTR lookups (the crate forbids unsafe code).
+dns-lookup = "4"
 flate2 = "1"
 # Same major version as tao uses: the file chooser takes tao's GTK window.
 gtk = "0.18"
 httparse = "1"
 libc = "0.2"
+# Safe wrappers: packet addresses (recvmsg), getifaddrs and signal masks.
+nix = { version = "0.31", default-features = false, features = ["socket", "net", "signal", "uio"] }
 # Public suffix list, to find the registrable domain for RDAP lookups.
 psl = "2"
 rcgen = "0.14"
+# Safe wrappers: descriptor passing (SCM_RIGHTS), send flags, socket timeouts.
+rustix = { version = "1", features = ["net"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 ruzstd = "0.9.1"
 serde = { version = "1", features = ["derive"] }

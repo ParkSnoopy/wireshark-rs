@@ -42,7 +42,7 @@ pub struct Row {
     pub learned: Vec<(IpAddr, String)>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct IfRef {
     pub name: String,
     /// True for an address of this host, false for one on the interface's network.
@@ -101,7 +101,7 @@ pub fn row(no: u64, rel_us: u64, len: u32, ethertype: u16, data: &[u8]) -> Row {
 }
 
 impl Summary {
-    fn other(proto: String) -> Self {
+    const fn other(proto: String) -> Self {
         Self {
             src: String::new(),
             dst: String::new(),

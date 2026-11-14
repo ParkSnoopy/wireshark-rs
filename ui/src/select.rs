@@ -1,21 +1,52 @@
-//! Themed dropdown. WebKitGTK draws the popup of a native `<select>` with
+//! Themed dropdown. `WebKitGTK` draws the popup of a native `<select>` with
 //! GTK, so CSS cannot style it. This listbox uses the `.select` and `.menu`
 //! classes of style.css instead.
 
 use leptos::ev::KeyboardEvent;
 use leptos::prelude::*;
 
-#[component]
-pub fn Select(
-    /// DOM id of the trigger button. Also the prefix of the menu and option ids.
+/// The options of the open listbox; `active` is the one the keys move.
+fn options_view(
+    id: &'static str,
+    options: Vec<String>,
+    value: RwSignal<String>,
+    active: RwSignal<usize>,
+    choose: Callback<usize>,
+) -> impl IntoView {
+    options
+        .into_iter()
+        .enumerate()
+        .map(|(i, option)| {
+            let selected = value.get_untracked() == option;
+            view! {
+                <li
+                    class="menu-item"
+                    class:is-active=move || active.get() == i
+                    role="option"
+                    id=format!("{id}-opt-{i}")
+                    aria-selected=selected.to_string()
+                    // mousedown, not click: keeps focus on the trigger.
+                    on:mousedown=move |ev| {
+                        ev.prevent_default();
+                        choose.run(i);
+                    }
+                    on:mouseenter=move |_| active.set(i)
+                >
+                    {option}
+                </li>
+            }
+        })
+        .collect_view()
+}
+
+/// Dropdown labelled `label` that sets `value` to one of `options`. `id` is
+/// the DOM id of the trigger button, and the prefix of the menu and option ids.
+pub fn select(
     id: &'static str,
     label: &'static str,
-    #[prop(into)] options: Signal<Vec<String>>,
+    options: Signal<Vec<String>>,
     value: RwSignal<String>,
-    #[prop(into, optional)] disabled: Signal<bool>,
-    /// Keeps the label for screen readers only.
-    #[prop(optional)]
-    hide_label: bool,
+    disabled: Signal<bool>,
 ) -> impl IntoView {
     let open = RwSignal::new(false);
     let active = RwSignal::new(0_usize);
@@ -64,7 +95,7 @@ pub fn Select(
 
     view! {
         <div class="field">
-            <span class="field-label" class:visually-hidden=hide_label id=format!("{id}-label")>
+            <span class="field-label" id=format!("{id}-label")>
                 {label}
             </span>
             <div class="select">
@@ -93,33 +124,7 @@ pub fn Select(
                         id=format!("{id}-menu")
                         aria-labelledby=format!("{id}-label")
                     >
-                        {move || {
-                            options
-                                .get()
-                                .into_iter()
-                                .enumerate()
-                                .map(|(i, option)| {
-                                    let selected = value.get_untracked() == option;
-                                    view! {
-                                        <li
-                                            class="menu-item"
-                                            class:is-active=move || active.get() == i
-                                            role="option"
-                                            id=format!("{id}-opt-{i}")
-                                            aria-selected=selected.to_string()
-                                            // mousedown, not click: keeps focus on the trigger.
-                                            on:mousedown=move |ev| {
-                                                ev.prevent_default();
-                                                choose(i);
-                                            }
-                                            on:mouseenter=move |_| active.set(i)
-                                        >
-                                            {option}
-                                        </li>
-                                    }
-                                })
-                                .collect_view()
-                        }}
+                        {move || options_view(id, options.get(), value, active, Callback::new(choose))}
                     </ul>
                 </Show>
             </div>

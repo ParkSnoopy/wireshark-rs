@@ -4,6 +4,8 @@
 //! the rows in view (plus `OVERSCAN` above and below) are in the DOM, and
 //! two spacer rows keep the scroll height right.
 
+use std::fmt::Write as _;
+
 use leptos::ev::MouseEvent;
 use leptos::html;
 use leptos::prelude::*;
@@ -12,7 +14,7 @@ use wasm_bindgen::JsCast;
 use crate::model::{
     Col, Domains, IfRef, Ptrs, Row, Stack, TableView, bytes, duration, ptr_of, scope,
 };
-use crate::tip::Tip;
+use crate::tip::tip;
 
 /// Packets listed under "Recent in conversation".
 const RECENT: usize = 5;
@@ -33,30 +35,136 @@ const COLUMNS: [(Col, &str, bool); 8] = [
 ];
 
 /// True when new rows enter at the top: the view then keeps its place.
-pub fn newest_first(sort: (Col, bool)) -> bool {
+pub const fn newest_first(sort: (Col, bool)) -> bool {
     matches!(sort, (Col::No | Col::Time, true))
 }
 
-#[component]
-pub fn PacketTable(
-    /// Every row of the capture, in arrival order.
+/// Scroll state of the virtualized table, in px.
+#[derive(Clone, Copy)]
+struct Scroll {
+    scroller: NodeRef<html::Div>,
+    top: RwSignal<f64>,
+    view_height: RwSignal<f64>,
+    row_height: RwSignal<f64>,
+}
+
+impl Scroll {
+    /// Takes the scroll offset and viewport height from the DOM.
+    fn read(self) {
+        if let Some(el) = self.scroller.get_untracked() {
+            self.top.set(f64::from(el.scroll_top()));
+            self.view_height.set(f64::from(el.client_height()));
+        }
+    }
+}
+
+/// Newest-first view: when packets arrive while the user reads further
+/// down, scrolls by their height so the rows in view stay where they are.
+fn keep_place(
     rows: RwSignal<Vec<Row>>,
-    /// Rows that pass the filter, in display order, with collapsed stacks.
-    view: Memo<TableView>,
-    /// Sorted column and whether the order is descending.
+    visible: Memo<Vec<usize>>,
     sort: RwSignal<(Col, bool)>,
-    /// Registration data of the host names seen, for the recent-domain flag.
+    scroll: Scroll,
+) {
+    let seen = StoredValue::new((0_usize, None::<usize>));
+    Effect::new(move |_| {
+        let top = visible.with(|v| v.first().copied());
+        let total = rows.with(Vec::len);
+        let (old_total, old_top) = seen.get_value();
+        seen.set_value((total, top));
+        let Some(el) = scroll.scroller.get_untracked() else {
+            return;
+        };
+        if total <= old_total || el.scroll_top() <= 0 || !newest_first(sort.get_untracked()) {
+            return;
+        }
+        // Rows now above the old top row. A collapsed flow whose newest row
+        // was the top moves to a new index: then nothing is shifted.
+        let added = old_top.map_or(0, |t| {
+            visible.with_untracked(|v| v.iter().position(|&i| i == t).unwrap_or(0))
+        });
+        let shift = added as f64 * scroll.row_height.get_untracked();
+        // After this update reaches the DOM, before the next paint.
+        request_animation_frame(move || {
+            el.set_scroll_top(el.scroll_top() + shift as i32);
+            scroll.top.set(f64::from(el.scroll_top()));
+        });
+    });
+}
+
+/// Measures the real row height once rows exist, and the viewport height.
+fn measure_rows(range: Memo<(usize, usize)>, scroll: Scroll) {
+    Effect::new(move |_| {
+        range.track();
+        let Some(el) = scroll.scroller.get() else {
+            return;
+        };
+        let row = el.query_selector("tbody tr[data-idx]").ok().flatten();
+        if let Some(h) = row
+            .map(|r| r.get_bounding_client_rect().height())
+            .filter(|&h| h > 0.0 && (h - scroll.row_height.get_untracked()).abs() > 0.1)
+        {
+            scroll.row_height.set(h);
+        }
+        scroll.view_height.set(f64::from(el.client_height()));
+    });
+}
+
+/// Row that says why the table is empty, while it is.
+fn empty_row(rows: RwSignal<Vec<Row>>, visible: Memo<Vec<usize>>) -> impl IntoView {
+    let text = move || {
+        if rows.with(Vec::is_empty) {
+            "No packets yet. Choose an interface and press Start."
+        } else {
+            "No packet matches the filter."
+        }
+    };
+    view! {
+        <Show when=move || visible.with(Vec::is_empty)>
+            <tr class="empty">
+                <td colspan="8">{text}</td>
+            </tr>
+        </Show>
+    }
+}
+
+/// Index of the table row a mouse event happened on, from its `data-idx`.
+fn row_at(ev: &MouseEvent) -> Option<usize> {
+    ev.target()
+        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        .and_then(|e| e.closest("tr[data-idx]").ok().flatten())
+        .and_then(|tr| tr.get_attribute("data-idx"))
+        .and_then(|v| v.parse::<usize>().ok())
+}
+
+/// Virtualized packet table with sortable columns and hover cards.
+pub fn packet_table(
+    // Every row of the capture, in arrival order.
+    rows: RwSignal<Vec<Row>>,
+    // Rows that pass the filter, in display order, with collapsed stacks.
+    view: Memo<TableView>,
+    // Sorted column and whether the order is descending.
+    sort: RwSignal<(Col, bool)>,
+    // Registration data of the host names seen, for the recent-domain flag.
     domains: RwSignal<Domains>,
-    /// Reverse DNS names, shown after addresses.
+    // Reverse DNS names, shown after addresses.
     ptrs: RwSignal<Ptrs>,
-    /// Index of the clicked row, which the inspector shows.
+    // Index of the clicked row, which the inspector shows.
     selected: RwSignal<Option<usize>>,
 ) -> impl IntoView {
     let visible = Memo::new(move |_| view.with(|v| v.rows.clone()));
-    let scroller = NodeRef::<html::Div>::new();
-    let scroll_top = RwSignal::new(0.0);
-    let view_height = RwSignal::new(1200.0);
-    let row_height = RwSignal::new(ROW_HEIGHT);
+    let scroll = Scroll {
+        scroller: NodeRef::new(),
+        top: RwSignal::new(0.0),
+        view_height: RwSignal::new(1200.0),
+        row_height: RwSignal::new(ROW_HEIGHT),
+    };
+    let Scroll {
+        scroller,
+        top: scroll_top,
+        view_height,
+        row_height,
+    } = scroll;
     let hover = RwSignal::new(None::<usize>);
     let cursor = RwSignal::new((0, 0));
 
@@ -73,70 +181,16 @@ pub fn PacketTable(
         let (a, b) = range.get();
         visible.with(|v| v[a..b].to_vec())
     };
-
-    // Newest-first view: when packets arrive while the user reads further
-    // down, scroll by their height so the rows in view stay where they are.
-    let seen = StoredValue::new((0_usize, None::<usize>));
-    Effect::new(move |_| {
-        let top = visible.with(|v| v.first().copied());
-        let total = rows.with(Vec::len);
-        let (old_total, old_top) = seen.get_value();
-        seen.set_value((total, top));
-        let Some(el) = scroller.get_untracked() else {
-            return;
-        };
-        if total <= old_total || el.scroll_top() <= 0 || !newest_first(sort.get_untracked()) {
-            return;
-        }
-        // Rows now above the old top row. A collapsed flow whose newest row
-        // was the top moves to a new index: then nothing is shifted.
-        let added = old_top.map_or(0, |t| {
-            visible.with_untracked(|v| v.iter().position(|&i| i == t).unwrap_or(0))
-        });
-        let shift = added as f64 * row_height.get_untracked();
-        // After this update reaches the DOM, before the next paint.
-        request_animation_frame(move || {
-            el.set_scroll_top(el.scroll_top() + shift as i32);
-            scroll_top.set(f64::from(el.scroll_top()));
-        });
-    });
-
-    // Measure the real row height once rows exist.
-    Effect::new(move |_| {
-        range.track();
-        let Some(el) = scroller.get() else { return };
-        let row = el.query_selector("tbody tr[data-idx]").ok().flatten();
-        if let Some(h) = row
-            .map(|r| r.get_bounding_client_rect().height())
-            .filter(|&h| h > 0.0 && (h - row_height.get_untracked()).abs() > 0.1)
-        {
-            row_height.set(h);
-        }
-        view_height.set(f64::from(el.client_height()));
-    });
+    keep_place(rows, visible, sort, scroll);
+    measure_rows(range, scroll);
 
     // One delegated handler for all rows: reads the row index from data-idx.
-    let row_at = |ev: &MouseEvent| {
-        ev.target()
-            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
-            .and_then(|e| e.closest("tr[data-idx]").ok().flatten())
-            .and_then(|tr| tr.get_attribute("data-idx"))
-            .and_then(|v| v.parse::<usize>().ok())
-    };
     let on_move = move |ev: MouseEvent| {
         let idx = row_at(&ev);
         if hover.get_untracked() != idx {
             hover.set(idx);
         }
         cursor.set((ev.client_x(), ev.client_y()));
-    };
-
-    let empty_text = move || {
-        if rows.with(Vec::is_empty) {
-            "No packets yet. Choose an interface and press Start."
-        } else {
-            "No packet matches the filter."
-        }
     };
     let spacer = move |height: f64| format!("height: {height}px");
 
@@ -146,21 +200,11 @@ pub fn PacketTable(
             tabindex="0"
             aria-label="Captured packets"
             node_ref=scroller
-            on:scroll=move |_| {
-                if let Some(el) = scroller.get_untracked() {
-                    scroll_top.set(f64::from(el.scroll_top()));
-                    view_height.set(f64::from(el.client_height()));
-                }
-            }
+            on:scroll=move |_| scroll.read()
         >
             <table class="packets" aria-rowcount=move || visible.with(Vec::len) + 1>
                 <thead>
-                    <tr>
-                        {COLUMNS
-                            .into_iter()
-                            .map(|(col, label, num)| view! { <SortHeader col label num sort /> })
-                            .collect_view()}
-                    </tr>
+                    <tr>{COLUMNS.map(|(col, label, num)| sort_header(col, label, num, sort)).collect_view()}</tr>
                 </thead>
                 <tbody
                     on:mousemove=on_move
@@ -172,11 +216,7 @@ pub fn PacketTable(
                         hover.set(None);
                     }
                 >
-                    <Show when=move || visible.with(Vec::is_empty)>
-                        <tr class="empty">
-                            <td colspan="8">{empty_text}</td>
-                        </tr>
-                    </Show>
+                    {empty_row(rows, visible)}
                     <tr class="spacer" aria-hidden="true" style=move || spacer(range.get().0 as f64 * row_height.get())>
                         <td colspan="8"></td>
                     </tr>
@@ -209,7 +249,7 @@ pub fn PacketTable(
                 let current = rows.get(idx)?.clone();
                 let conversation: Vec<Row> = rows.iter().filter(|r| r.same_conversation(&current)).cloned().collect();
                 let ptrs = ptrs.with(|p| ptr_names(p, &current));
-                Some(view! { <HoverCard current conversation stack flag ptrs cursor /> })
+                Some(hover_card(&current, &conversation, stack, flag, ptrs, cursor))
             })
         }}
     }
@@ -239,11 +279,11 @@ fn packet_row(
             <td>{r.time.clone()}</td>
             <td>
                 <span class="addr-label">{src}</span>
-                {addr_tag(&r.src, r.src_if.as_ref(), src_ptr)}
+                {addr_tag(&r.src, r.src_if.as_ref(), src_ptr.as_deref())}
             </td>
             <td>
                 <span class="addr-label">{dst}</span>
-                {addr_tag(&r.dst, r.dst_if.as_ref(), dst_ptr)}
+                {addr_tag(&r.dst, r.dst_if.as_ref(), dst_ptr.as_deref())}
             </td>
             <td class="proto">
                 {r.protocol().to_owned()}
@@ -264,13 +304,8 @@ fn packet_row(
 
 /// Muted note after an address: its PTR name, scope (`private`) and
 /// related interface.
-fn addr_tag(
-    addr: &str,
-    iface: Option<&IfRef>,
-    ptr: Option<String>,
-) -> Option<impl IntoView + use<>> {
+fn addr_tag(addr: &str, iface: Option<&IfRef>, ptr: Option<&str>) -> Option<impl IntoView + use<>> {
     let parts: Vec<&str> = ptr
-        .as_deref()
         .into_iter()
         .chain(scope(addr).map(|s| s.kind))
         .chain(iface.map(|i| i.name.as_str()))
@@ -284,8 +319,8 @@ fn ptr_names(ptrs: &Ptrs, r: &Row) -> (Option<String>, Option<String>) {
     (name(&r.src), name(&r.dst))
 }
 
-#[component]
-fn SortHeader(
+/// Column header that sorts by `col`, and flips the order on a second click.
+fn sort_header(
     col: Col,
     label: &'static str,
     num: bool,
@@ -323,27 +358,26 @@ fn SortHeader(
     }
 }
 
-#[component]
-fn HoverCard(
-    current: Row,
-    conversation: Vec<Row>,
+/// Hover card of the packet `current` and the `conversation` it belongs to.
+fn hover_card(
+    current: &Row,
+    conversation: &[Row],
     stack: Option<Stack>,
     flag: Option<(String, String)>,
-    /// PTR names of the source and destination.
+    // PTR names of the source and destination.
     ptrs: (Option<String>, Option<String>),
     cursor: RwSignal<(i32, i32)>,
-) -> impl IntoView {
+) -> impl IntoView + use<> {
     let (src, dst) = current.labels();
     let forward = conversation
         .iter()
-        .filter(|r| r.same_direction(&current))
+        .filter(|r| r.same_direction(current))
         .count();
     let backward = conversation.len() - forward;
     let total: u64 = conversation.iter().map(|r| u64::from(r.len)).sum();
     let t0 = conversation.first().map_or(0.0, Row::secs);
     let span = conversation.last().map_or(0.0, Row::secs) - t0;
-    let recent: Vec<Row> = conversation.iter().rev().take(RECENT).cloned().collect();
-    let chart = chart(&current, &conversation);
+    let chart = chart(current, conversation);
     let end = |addr: &str, iface: &Option<IfRef>, process: &Option<String>, ptr: Option<String>| {
         let mut parts = Vec::new();
         if let Some(s) = scope(addr) {
@@ -370,8 +404,7 @@ fn HoverCard(
         }
     };
 
-    view! {
-        <Tip cursor>
+    let content = view! {
             <h4>{format!("{} {src} → {dst}", current.protocol().to_uppercase())}</h4>
             {flag.map(|(name, why)| view! {
                 <p class="tip-flag">{format!("⚠ {name} was {why}. Check that this traffic is expected.")}</p>
@@ -402,10 +435,12 @@ fn HoverCard(
             <div class="tip-section">
                 <p class="tip-title">"Recent in conversation"</p>
                 <ul class="tip-related">
-                    {recent
-                        .into_iter()
+                    {conversation
+                        .iter()
+                        .rev()
+                        .take(RECENT)
                         .map(|r| {
-                            let arrow = if r.same_direction(&current) { "→" } else { "←" };
+                            let arrow = if r.same_direction(current) { "→" } else { "←" };
                             let line = format!(
                                 "#{} +{} {arrow} {}B {}",
                                 r.no,
@@ -418,8 +453,8 @@ fn HoverCard(
                         .collect_view()}
                 </ul>
             </div>
-        </Tip>
-    }
+    };
+    tip(cursor, content)
 }
 
 /// Bytes over time for the conversation as two overlaid area series: cream
@@ -449,14 +484,15 @@ fn chart(current: &Row, conversation: &[Row]) -> impl IntoView + use<> {
         series[usize::from(!r.same_direction(current))][bucket_of(r)] += u64::from(r.len);
     }
     let peak = series.iter().flatten().copied().max().unwrap_or(1).max(1);
-    let x = |b: usize| X0 + b as f64 / (BUCKETS - 1) as f64 * (X1 - X0);
-    let y = |v: u64| BASE - v as f64 / peak as f64 * (BASE - TOP);
+    let x = |b: usize| (b as f64 / (BUCKETS - 1) as f64).mul_add(X1 - X0, X0);
+    let y = |v: u64| (v as f64 / peak as f64).mul_add(-(BASE - TOP), BASE);
     let area = |s: &[u64; BUCKETS]| {
         let mut d = format!("M{X0},{BASE}");
         for (b, &v) in s.iter().enumerate() {
-            d.push_str(&format!(" L{:.1},{:.1}", x(b), y(v)));
+            let _ = write!(d, " L{:.1},{:.1}", x(b), y(v));
         }
-        d + &format!(" L{X1},{BASE} Z")
+        let _ = write!(d, " L{X1},{BASE} Z");
+        d
     };
     let [fwd, back] = &series;
     let hb = bucket_of(current);

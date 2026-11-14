@@ -2,6 +2,8 @@
 //! responses of its conversation, and its bytes. HTTPS content comes from
 //! the proxy, when the client used it.
 
+use std::fmt::Write as _;
+
 use leptos::prelude::*;
 
 use crate::model::{
@@ -21,16 +23,16 @@ enum Part {
     Payload,
 }
 
-#[component]
-pub fn Inspector(
+/// Side panel with the selected packet's conversation, messages and payload.
+pub fn inspector(
     rows: RwSignal<Vec<Row>>,
     selected: RwSignal<Option<usize>>,
-    /// Detail of the selected packet, once the shell sent it.
+    // Detail of the selected packet, once the shell sent it.
     inspection: RwSignal<Option<Inspection>>,
-    /// Requests decrypted by the HTTPS proxy.
+    // Requests decrypted by the HTTPS proxy.
     exchanges: RwSignal<Vec<Exchange>>,
     ptrs: RwSignal<Ptrs>,
-    /// Asks the shell for the detail of a packet number.
+    // Asks the shell for the detail of a packet number.
     request: Callback<u64>,
 ) -> impl IntoView {
     let part = RwSignal::new(Part::Messages);
@@ -71,7 +73,7 @@ pub fn Inspector(
                         .with(|e| e.iter().filter(|e| current.carries(e)).cloned().collect());
                     let detail =
                         inspection.with(|i| i.as_ref().filter(|i| i.no == current.no).cloned());
-                    messages(&current, detail, proxied, jump).into_any()
+                    messages(&current, detail, &proxied, jump).into_any()
                 }
                 Part::Payload => {
                     let detail =
@@ -117,6 +119,35 @@ pub fn Inspector(
     }
 }
 
+/// Other flows between the two hosts of `current`, newest first, by protocol
+/// and ports: `(flow, packets, bytes, newest packet number)`.
+fn other_flows(rows: &[Row], current: &Row) -> Vec<(String, u64, u64, u64)> {
+    let mut flows: Vec<(String, u64, u64, u64)> = Vec::new();
+    let same_hosts = |r: &Row| {
+        (r.src == current.src && r.dst == current.dst
+            || r.src == current.dst && r.dst == current.src)
+            && !r.same_conversation(current)
+    };
+    let port = |p: Option<u16>| p.map_or_else(|| "-".into(), |p| p.to_string());
+    for r in rows.iter().rev().filter(|r| same_hosts(r)) {
+        let key = format!(
+            "{} {}:{} → {}:{}",
+            r.protocol(),
+            r.src,
+            port(r.sport),
+            r.dst,
+            port(r.dport),
+        );
+        if let Some(f) = flows.iter_mut().find(|f| f.0 == key) {
+            f.1 += 1;
+            f.2 += u64::from(r.len);
+        } else {
+            flows.push((key, 1, u64::from(r.len), r.no));
+        }
+    }
+    flows
+}
+
 /// Packets of the same conversation, and other flows between the two hosts.
 fn related(
     current: &Row,
@@ -130,31 +161,7 @@ fn related(
             .filter(|r| r.same_conversation(current))
             .cloned()
             .collect();
-        // Other flows between the same two hosts, newest first, by protocol and ports.
-        let mut flows: Vec<(String, u64, u64, u64)> = Vec::new();
-        let same_hosts = |r: &Row| {
-            (r.src == current.src && r.dst == current.dst
-                || r.src == current.dst && r.dst == current.src)
-                && !r.same_conversation(current)
-        };
-        for r in rows.iter().rev().filter(|r| same_hosts(r)) {
-            let key = format!(
-                "{} {}:{} → {}:{}",
-                r.protocol(),
-                r.src,
-                r.sport.map_or("-".into(), |p| p.to_string()),
-                r.dst,
-                r.dport.map_or("-".into(), |p| p.to_string()),
-            );
-            match flows.iter_mut().find(|f| f.0 == key) {
-                Some(f) => {
-                    f.1 += 1;
-                    f.2 += u64::from(r.len);
-                }
-                None => flows.push((key, 1, u64::from(r.len), r.no)),
-            }
-        }
-        (conversation, flows)
+        (conversation, other_flows(rows, current))
     });
     let t0 = conversation.first().map_or(0.0, Row::secs);
     let total: u64 = conversation.iter().map(|r| u64::from(r.len)).sum();
@@ -167,12 +174,6 @@ fn related(
             .flatten()
             .collect::<Vec<_>>()
     });
-    let list: Vec<Row> = conversation
-        .iter()
-        .rev()
-        .take(RELATED_MAX)
-        .cloned()
-        .collect();
     let current_no = current.no;
     let out = current.clone();
     view! {
@@ -184,8 +185,10 @@ fn related(
             </p>
             {names.into_iter().map(|n| view! { <p class="inspector-note">{n}</p> }).collect_view()}
             <ul class="related-list">
-                {list
-                    .into_iter()
+                {conversation
+                    .iter()
+                    .rev()
+                    .take(RELATED_MAX)
                     .map(|r| {
                         let no = r.no;
                         let arrow = if r.same_direction(&out) { "→" } else { "←" };
@@ -241,7 +244,7 @@ fn related(
 fn messages(
     current: &Row,
     detail: Option<Inspection>,
-    proxied: Vec<Exchange>,
+    proxied: &[Exchange],
     jump: Callback<u64>,
 ) -> impl IntoView + use<> {
     let encrypted = matches!(current.protocol(), "https" | "tls" | "quic" | "ssh" | "dot");
@@ -249,7 +252,7 @@ fn messages(
         view! {
             <section class="inspector-section">
                 <h4>"Through the interception proxy"</h4>
-                {proxied.into_iter().map(|e| view! { <ExchangeView ex=e open=true /> }).collect_view()}
+                {proxied.iter().map(|e| exchange_view(e, true)).collect_view()}
             </section>
         }
     });
@@ -271,7 +274,7 @@ fn messages(
                             "This traffic is encrypted. Turn on the HTTPS proxy to read the content of new connections."
                         </p>
                     })}
-                    {d.turns.into_iter().map(|t| turn(t, jump)).collect_view()}
+                    {d.turns.iter().map(|t| turn(t, jump)).collect_view()}
                     {(omitted > 0).then(|| view! {
                         <p class="inspector-note">{format!("{} more not shown.", bytes(omitted as u64))}</p>
                     })}
@@ -283,7 +286,7 @@ fn messages(
     view! { {proxy_view} {captured} }
 }
 
-fn turn(t: Turn, jump: Callback<u64>) -> impl IntoView {
+fn turn(t: &Turn, jump: Callback<u64>) -> impl IntoView + use<> {
     let label = if t.client { "Request" } else { "Response" };
     let packets = if t.first == t.last {
         format!("#{}", t.first)
@@ -388,9 +391,8 @@ fn payload(detail: Option<Inspection>) -> impl IntoView + use<> {
     .into_any()
 }
 
-/// One decrypted request and its response.
-#[component]
-pub fn ExchangeView(ex: Exchange, #[prop(optional)] open: bool) -> impl IntoView {
+/// One decrypted request and its response; `open` shows it unfolded.
+pub fn exchange_view(ex: &Exchange, open: bool) -> impl IntoView + use<> {
     // TLS and TCP rows are whole connections relayed as bytes.
     let relayed = ex.status.is_none() && matches!(ex.method.as_str(), "TLS" | "TCP");
     let status = match (&ex.error, ex.status) {
@@ -449,7 +451,10 @@ fn message_part(
     if body.truncated && !body.data.is_empty() {
         facts.push(format!("first {} shown", bytes(body.data.len() as u64)));
     }
-    let head: String = headers.iter().map(|(n, v)| format!("{n}: {v}\n")).collect();
+    let head = headers.iter().fold(String::new(), |mut head, (n, v)| {
+        let _ = writeln!(head, "{n}: {v}");
+        head
+    });
     let data = body.data.clone();
     let request = matches!(label, "Request" | "Client → server");
     view! {
