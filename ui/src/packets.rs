@@ -49,6 +49,8 @@ pub fn PacketTable(
     domains: RwSignal<Domains>,
     /// Reverse DNS names, shown after addresses.
     ptrs: RwSignal<Ptrs>,
+    /// Index of the clicked row, which the inspector shows.
+    selected: RwSignal<Option<usize>>,
 ) -> impl IntoView {
     let visible = Memo::new(move |_| view.with(|v| v.rows.clone()));
     let scroller = NodeRef::<html::Div>::new();
@@ -56,7 +58,6 @@ pub fn PacketTable(
     let view_height = RwSignal::new(1200.0);
     let row_height = RwSignal::new(ROW_HEIGHT);
     let hover = RwSignal::new(None::<usize>);
-    let selected = RwSignal::new(None::<usize>);
     let cursor = RwSignal::new((0, 0));
 
     let range = Memo::new(move |_| {
@@ -164,7 +165,12 @@ pub fn PacketTable(
                 <tbody
                     on:mousemove=on_move
                     on:mouseleave=move |_| hover.set(None)
-                    on:click=move |ev| selected.set(row_at(&ev))
+                    on:click=move |ev| {
+                        // A second click on the selected row closes the inspector.
+                        let idx = row_at(&ev);
+                        selected.set(if selected.get_untracked() == idx { None } else { idx });
+                        hover.set(None);
+                    }
                 >
                     <Show when=move || visible.with(Vec::is_empty)>
                         <tr class="empty">

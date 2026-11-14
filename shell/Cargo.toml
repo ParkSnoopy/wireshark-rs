@@ -6,13 +6,21 @@ edition = "2024"
 default-run = "wireshark-rs"
 
 [dependencies]
+brotli-decompressor = "6.3.1"
+flate2 = "1"
 # Same major version as tao uses: the file chooser takes tao's GTK window.
 gtk = "0.18"
+httparse = "1"
 libc = "0.2"
 # Public suffix list, to find the registrable domain for RDAP lookups.
 psl = "2"
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+ruzstd = "0.9.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tao = "0.37"
+time = "0.3"
 ureq = { version = "3", features = ["json"] }
+webpki-roots = "1"
 wry = "0.57"

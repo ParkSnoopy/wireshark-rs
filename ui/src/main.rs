@@ -1,9 +1,10 @@
 //! Leptos UI. Runs inside the shell's webview and talks to it only through
 //! `window.ipc.postMessage` (out) and `pkts` / `status` / `domain` /
-//! `notice` window events (in).
+//! `ptr` / `notice` / `inspect` / `http` / `mitm` window events (in).
 
 mod filters;
 mod graph;
+mod inspector;
 mod model;
 mod networks;
 mod packets;
@@ -18,8 +19,10 @@ use wasm_bindgen::prelude::*;
 
 use filters::FilterDialog;
 use graph::GraphPage;
+use inspector::{ExchangeView, Inspector};
 use model::{
-    Col, DomainInfo, Domains, Filter, Graph, Hosts, Ptrs, Row, Rules, TableView, table_view,
+    Col, DomainInfo, Domains, Exchange, Filter, Graph, Hosts, Inspection, MitmState, Ptrs, Row,
+    Rules, TableView, table_view,
 };
 use networks::NetworksPage;
 use packets::PacketTable;
@@ -34,6 +37,8 @@ struct Notice {
 
 /// How long a notice stays, in milliseconds.
 const NOTICE_MS: u64 = 6000;
+/// Decrypted requests kept; each holds up to 128 KiB of bodies.
+const EXCHANGES_MAX: usize = 500;
 
 /// `state` is `pending`, `idle`, `capturing`, `stopped` or `error`.
 /// style.css colors the status dot by it.
@@ -48,16 +53,18 @@ enum Tab {
     Packets,
     Graph,
     Networks,
+    Https,
 }
 
 impl Tab {
-    const ALL: [Tab; 3] = [Tab::Packets, Tab::Graph, Tab::Networks];
+    const ALL: [Tab; 4] = [Tab::Packets, Tab::Graph, Tab::Networks, Tab::Https];
 
     fn id(self) -> &'static str {
         match self {
             Tab::Packets => "tab-packets",
             Tab::Graph => "tab-graph",
             Tab::Networks => "tab-networks",
+            Tab::Https => "tab-https",
         }
     }
 }
@@ -110,6 +117,12 @@ fn App() -> impl IntoView {
     let rules = RwSignal::new(Rules::default());
     // Newest first: new packets enter at the top, the oldest end up at the bottom.
     let sort = RwSignal::new((Col::No, true));
+    // Clicked row (index into `rows`) and its detail from the shell.
+    let selected = RwSignal::new(None::<usize>);
+    let inspection = RwSignal::new(None::<Inspection>);
+    // HTTPS proxy state and what it decrypted, newest last.
+    let mitm = RwSignal::new(MitmState::default());
+    let exchanges = RwSignal::new(Vec::<Exchange>::new());
 
     let busy = Signal::derive(move || {
         status.with(|s| matches!(s.state.as_str(), "pending" | "capturing"))
@@ -185,6 +198,36 @@ fn App() -> impl IntoView {
             post_message(&format!("ptr {}", new.join(" ")));
         }
     });
+    window_event_listener_untyped("inspect", move |ev| {
+        if let Some(i) = detail::<Inspection>(ev) {
+            inspection.set(Some(i));
+        }
+    });
+    window_event_listener_untyped("mitm", move |ev| {
+        if let Some(m) = detail::<MitmState>(ev) {
+            mitm.set(m);
+        }
+    });
+    window_event_listener_untyped("http", move |ev| {
+        if let Some(e) = detail::<Exchange>(ev) {
+            exchanges.update(|x| {
+                if x.len() == EXCHANGES_MAX {
+                    x.remove(0);
+                }
+                x.push(e);
+            });
+        }
+    });
+    let inspect = Callback::new(move |no: u64| post_message(&format!("inspect {no}")));
+    // Ask for the detail of each newly clicked packet.
+    Effect::new(move |_| {
+        if let Some(no) = selected
+            .get()
+            .and_then(|i| rows.with_untracked(|r| r.get(i).map(|r| r.no)))
+        {
+            inspect.run(no);
+        }
+    });
     let notice_seq = StoredValue::new(0_u64);
     window_event_listener_untyped("notice", move |ev| {
         if let Some(n) = detail::<Notice>(ev) {
@@ -232,6 +275,8 @@ fn App() -> impl IntoView {
     post_message("hello");
 
     let start = move |_| {
+        selected.set(None);
+        inspection.set(None);
         rows.set(Vec::new());
         graph.set(Graph::default());
         hosts.set(Hosts::default());
@@ -308,15 +353,30 @@ fn App() -> impl IntoView {
                     >
                         "PTR names"
                     </button>
+                    <button
+                        type="button"
+                        class="chip chip-filter mitm-toggle"
+                        aria-pressed=move || mitm.with(|m| m.on).to_string()
+                        title="Run an HTTPS proxy that decrypts the traffic of clients you send through it. Off by default."
+                        on:click=move |_| {
+                            let on = !mitm.with_untracked(|m| m.on);
+                            post_message(if on { "mitm on" } else { "mitm off" });
+                        }
+                    >
+                        "HTTPS proxy"
+                    </button>
                     <span class="count">{seen} " packets"</span>
                 </div>
+                <MitmBanner mitm />
             </header>
+
             <div class="sheet-bar">
                 <SheetTabs
                     tab
                     packets=Signal::derive(move || rows.with(Vec::len))
                     hosts=Signal::derive(move || graph.with(Graph::hosts))
                     blocks=Signal::derive(move || hosts.with(|h| h.0.len()))
+                    requests=Signal::derive(move || exchanges.with(Vec::len))
                 />
                 <Show when=move || tab.get() == Tab::Packets>
                     <div class="filter" role="search">
@@ -364,7 +424,10 @@ fn App() -> impl IntoView {
                     aria-labelledby="tab-packets"
                     hidden=move || tab.get() != Tab::Packets
                 >
-                    <PacketTable rows view sort domains ptrs />
+                    <div class="packets-split">
+                        <PacketTable rows view sort domains ptrs selected />
+                        <Inspector rows selected inspection exchanges ptrs request=inspect />
+                    </div>
                 </div>
                 <div
                     role="tabpanel"
@@ -387,6 +450,28 @@ fn App() -> impl IntoView {
                         active=Signal::derive(move || tab.get() == Tab::Networks)
                         on_show=show_in_table
                     />
+                </div>
+                <div
+                    role="tabpanel"
+                    id="panel-https"
+                    aria-labelledby="tab-https"
+                    hidden=move || tab.get() != Tab::Https
+                >
+                    <div class="https-list">
+                        <Show when=move || exchanges.with(Vec::is_empty)>
+                            <p class="inspector-note">
+                                "No decrypted requests. Turn on the HTTPS proxy, then send a client through it."
+                            </p>
+                        </Show>
+                        // Newest first, like the packet table.
+                        <For
+                            each=move || exchanges.with(|x| x.iter().rev().cloned().collect::<Vec<_>>())
+                            key=|e| e.id
+                            let:ex
+                        >
+                            <ExchangeView ex />
+                        </For>
+                    </div>
                 </div>
             </main>
         </div>
@@ -466,6 +551,7 @@ fn SheetTabs(
     packets: Signal<usize>,
     hosts: Signal<usize>,
     blocks: Signal<usize>,
+    requests: Signal<usize>,
 ) -> impl IntoView {
     let select = move |t: Tab| {
         tab.set(t);
@@ -532,6 +618,48 @@ fn SheetTabs(
                 "Networks",
                 Signal::derive(move || format!("{} addresses", blocks.get())),
             )}
+            {tab_button(
+                Tab::Https,
+                "tab-https",
+                "panel-https",
+                "HTTPS proxy",
+                Signal::derive(move || format!("{} requests", requests.get())),
+            )}
         </div>
+    }
+}
+
+/// Warning shown while the HTTPS proxy runs, with how to use it.
+#[component]
+fn MitmBanner(mitm: RwSignal<MitmState>) -> impl IntoView {
+    move || {
+        let m = mitm.get();
+        if let Some(e) = m.error {
+            return Some(view! { <p class="mitm-banner is-error" role="alert">{e}</p> }.into_any());
+        }
+        if !m.on {
+            return None;
+        }
+        let ca = m.ca.unwrap_or_default();
+        let example = format!(
+            "curl --proxy http://{} --cacert {ca} https://example.com/",
+            m.addr
+        );
+        Some(
+            view! {
+                <div class="mitm-banner" role="status">
+                    <p>
+                        <strong>"HTTPS proxy on at " {m.addr.clone()} "."</strong>
+                        " Clients that use this proxy and trust its certificate send their HTTPS content through this app, which can read it. "
+                        "The certificate is new for each run and stops working when the proxy stops; its key never leaves memory. "
+                        "Nothing else is changed: no system proxy, no system trust store."
+                    </p>
+                    <p class="mitm-example">
+                        "Certificate: " <code>{ca}</code> " · Try: " <code>{example}</code>
+                    </p>
+                </div>
+            }
+            .into_any(),
+        )
     }
 }

@@ -5,7 +5,8 @@
 
 use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::ops::ControlFlow;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -26,14 +27,7 @@ pub struct Recording {
 
 impl Recording {
     pub fn create() -> io::Result<Self> {
-        let cache = std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-            .ok_or_else(|| io::Error::other("no cache directory: HOME is not set"))?;
-        let dir = cache.join("wireshark-rs");
-        fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("capture-{}.pcap", std::process::id()));
+        let path = cache_dir()?.join(format!("capture-{}.pcap", std::process::id()));
         // Packets hold payloads: only this user may read the file.
         let file = OpenOptions::new()
             .write(true)
@@ -84,11 +78,46 @@ impl Recording {
 
     /// Copies the capture so far to `dest`. Returns the bytes written.
     pub fn save_to(&self, dest: &Path) -> io::Result<u64> {
+        self.flush()?;
+        fs::copy(&self.path, dest)
+    }
+
+    /// Calls `f` with the number (from 1), ethertype and network-layer bytes
+    /// of each recorded packet, in capture order, until it breaks.
+    pub fn scan(&self, mut f: impl FnMut(u64, u16, &[u8]) -> ControlFlow<()>) -> io::Result<()> {
+        self.flush()?;
+        let mut file = BufReader::new(File::open(&self.path)?);
+        file.seek_relative(24)?;
+        let mut record = [0u8; 16];
+        let mut data = Vec::new();
+        for no in 1.. {
+            // The capture thread may be mid-record at the end of the file.
+            match file.read_exact(&mut record) {
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                other => other?,
+            }
+            let caplen = u32::from_le_bytes([record[8], record[9], record[10], record[11]]);
+            data.resize(usize::try_from(caplen).unwrap_or(usize::MAX), 0);
+            match file.read_exact(&mut data) {
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                other => other?,
+            }
+            let Some(packet) = data.get(SLL_HEADER..) else {
+                continue;
+            };
+            let ethertype = u16::from_be_bytes([data[14], data[15]]);
+            if f(no, ethertype, packet).is_break() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn flush(&self) -> io::Result<()> {
         self.out
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .flush()?;
-        fs::copy(&self.path, dest)
+            .flush()
     }
 }
 
@@ -97,6 +126,18 @@ impl Drop for Recording {
         // The cache file holds payloads: do not leave it behind.
         let _ = fs::remove_file(&self.path);
     }
+}
+
+/// `wireshark-rs` in the user's cache directory, created if missing.
+pub fn cache_dir() -> io::Result<PathBuf> {
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .ok_or_else(|| io::Error::other("no cache directory: HOME is not set"))?;
+    let dir = cache.join("wireshark-rs");
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
 }
 
 /// Shows a save dialog without blocking the event loop. `on_path` runs with
@@ -155,6 +196,13 @@ mod tests {
             [1, 0, 0, 0, 0x20, 0xa1, 7, 0, 20, 0, 0, 0, 76, 0, 0, 0]
         );
         assert_eq!(b[40..56], [0, 4, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0]);
+        let mut seen = Vec::new();
+        rec.scan(|no, ethertype, d| {
+            seen.push((no, ethertype, d.to_vec()));
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(seen, [(1, 0x0800, vec![0x45, 0, 0, 20])]);
         let path = rec.path.clone();
         drop(rec);
         assert!(!path.exists());

@@ -202,6 +202,125 @@ impl Row {
     pub fn same_direction(&self, other: &Row) -> bool {
         self.src == other.src && self.sport == other.sport
     }
+
+    /// `addr:port` of each end, as the proxy writes socket addresses.
+    fn sockets(&self) -> Option<(String, String)> {
+        let sock = |a: &str, p: u16| match a.contains(':') {
+            true => format!("[{a}]:{p}"),
+            false => format!("{a}:{p}"),
+        };
+        Some((sock(&self.src, self.sport?), sock(&self.dst, self.dport?)))
+    }
+
+    /// True when this packet belongs to the proxy's connection to the
+    /// server for `ex`.
+    pub fn carries(&self, ex: &Exchange) -> bool {
+        let (Some((s, d)), Some(l), Some(r)) = (self.sockets(), &ex.local, &ex.remote) else {
+            return false;
+        };
+        self.proto == "TCP" && (s == *l && d == *r || s == *r && d == *l)
+    }
+}
+
+/// Packet detail from the shell, for the inspector.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct Inspection {
+    pub no: u64,
+    /// Network-layer bytes, possibly cut short of `caplen`.
+    pub bytes: Vec<u8>,
+    pub caplen: usize,
+    /// Where the TCP or UDP payload starts in `bytes`.
+    pub payload_at: Option<usize>,
+    /// The conversation's data in the order it was sent.
+    pub turns: Vec<Turn>,
+    /// Conversation bytes left out by the shell's limits.
+    pub omitted: usize,
+}
+
+/// Data one side sent before the other answered.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct Turn {
+    /// Sent by the side that spoke first: the client, usually.
+    pub client: bool,
+    pub first: u64,
+    pub last: u64,
+    pub len: usize,
+    /// Bytes the capture missed inside this turn.
+    pub gaps: usize,
+    pub data: Vec<u8>,
+}
+
+/// A request and its response, decrypted by the HTTPS proxy.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct Exchange {
+    pub id: u64,
+    pub conn: u64,
+    pub at_ms: u64,
+    pub ms: u64,
+    pub method: String,
+    pub url: String,
+    pub status: Option<u16>,
+    pub reason: String,
+    pub req_headers: Vec<(String, String)>,
+    pub req_body: Body,
+    pub resp_headers: Vec<(String, String)>,
+    pub resp_body: Body,
+    pub error: Option<String>,
+    pub client: String,
+    /// Proxy and server ends of the proxy's connection to the server.
+    pub local: Option<String>,
+    pub remote: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct Body {
+    pub size: usize,
+    pub data: Vec<u8>,
+    pub truncated: bool,
+    pub note: Option<String>,
+}
+
+/// State of the HTTPS proxy.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct MitmState {
+    pub on: bool,
+    pub addr: String,
+    /// Path of the CA certificate file clients must trust.
+    pub ca: Option<String>,
+    pub error: Option<String>,
+}
+
+/// True when `data` reads as text: UTF-8 with at most 2% control or
+/// invalid characters (a character cut off at the end is one of those).
+pub fn is_text(data: &[u8]) -> bool {
+    let s = String::from_utf8_lossy(data);
+    let odd = s
+        .chars()
+        .filter(|&c| c == '\u{fffd}' || c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+        .count();
+    odd * 50 <= s.chars().count()
+}
+
+/// Hex dump lines: offset (counted from `base`), 16 hex byte pairs and
+/// their printable ASCII.
+pub fn hexdump(data: &[u8], base: usize) -> Vec<(usize, String, String)> {
+    data.chunks(16)
+        .enumerate()
+        .map(|(i, line)| {
+            let hex: Vec<String> = line.iter().map(|b| format!("{b:02x}")).collect();
+            let ascii = line
+                .iter()
+                .map(|&b| {
+                    if b.is_ascii_graphic() || b == b' ' {
+                        b as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            (base + i * 16, hex.join(" "), ascii)
+        })
+        .collect()
 }
 
 /// Duration with a unit that keeps three significant digits for short spans.
@@ -946,6 +1065,36 @@ mod tests {
         assert!(a.same_conversation(&back) && back.same_conversation(&a));
         assert!(!a.same_conversation(&other_port) && !a.same_conversation(&udp));
         assert!(!a.same_direction(&back));
+    }
+
+    #[test]
+    fn proxy_exchange_matches_its_server_connection() {
+        let ex = Exchange {
+            local: Some("10.0.0.1:51000".into()),
+            remote: Some("[2001:db8::1]:443".into()),
+            ..Exchange::default()
+        };
+        let back = row(1, "2001:db8::1", Some(443), "10.0.0.1", Some(51000), "TCP");
+        let other = row(2, "10.0.0.1", Some(51001), "2001:db8::1", Some(443), "TCP");
+        assert!(back.carries(&ex) && !other.carries(&ex));
+        assert!(!back.carries(&Exchange::default()));
+    }
+
+    #[test]
+    fn text_and_hex() {
+        assert!(is_text(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"));
+        assert!(!is_text(&[0x16, 3, 1, 0, 0xa5, 1, 0, 0]));
+        assert_eq!(
+            hexdump(b"0123456789abcdefg\x01", 32),
+            [
+                (
+                    32,
+                    "30 31 32 33 34 35 36 37 38 39 61 62 63 64 65 66".into(),
+                    "0123456789abcdef".into()
+                ),
+                (48, "67 01".into(), "g.".into()),
+            ]
+        );
     }
 
     #[test]

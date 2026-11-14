@@ -1673,7 +1673,274 @@ body {
 
 .inspector-actions {
     display: flex;
+    flex: none;
     gap: var(--space-sm);
+}
+
+/* ---------- Packet inspector ---------- */
+
+/* Table and inspector side by side; the table takes what is left. */
+.packets-split {
+    display: flex;
+    height: 100%;
+    min-height: 0;
+}
+
+.packets-split > .table-scroll {
+    flex: 1 1 0;
+    min-width: 0;
+}
+
+.inspector-panel {
+    display: flex;
+    flex: 0 0 min(560px, 48%);
+    flex-direction: column;
+    min-width: 0;
+    border-left: 1px solid var(--divider);
+    background: var(--wash);
+}
+
+.inspector-panel > .inspector-head {
+    padding: var(--space-md) var(--space-md) var(--space-sm);
+}
+
+.inspector-head > div {
+    min-width: 0;
+}
+
+.inspector-route {
+    overflow: hidden;
+    color: var(--text-muted);
+    font: var(--type-small);
+    font-family: var(--font-mono);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.inspector-tabs {
+    padding: 4px var(--space-md) var(--space-sm);
+    border-bottom: 1px solid var(--divider);
+}
+
+.inspector-tabs [role="tab"] {
+    padding: 4px 12px;
+    border: none;
+    border-radius: var(--radius-full);
+    background: transparent;
+    color: var(--text-muted);
+    font: 500 12px / 18px var(--font-body);
+    cursor: pointer;
+}
+
+.inspector-tabs [role="tab"][aria-selected="true"] {
+    background: var(--primary);
+    color: var(--text-on-primary);
+}
+
+.inspector-tabs [role="tab"]:focus-visible {
+    outline: none;
+    box-shadow: var(--shadow-focus);
+}
+
+.inspector-body {
+    flex: 1;
+    min-height: 0;
+    padding: var(--space-md);
+    overflow-y: auto;
+}
+
+.inspector-section + .inspector-section {
+    margin-top: var(--space-lg);
+}
+
+.inspector-section h4 {
+    margin-bottom: var(--space-xs);
+    color: var(--text-muted);
+    font: 600 12px / 18px var(--font-body);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.inspector-note {
+    color: var(--text-muted);
+    font: var(--type-small);
+}
+
+.related-list {
+    margin: var(--space-sm) 0 0;
+    padding: 0;
+    list-style: none;
+}
+
+.related-item {
+    display: flex;
+    gap: var(--space-sm);
+    align-items: baseline;
+    width: 100%;
+    padding: 2px var(--space-sm);
+    border: none;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--text);
+    font: var(--type-small);
+    font-family: var(--font-mono);
+    text-align: left;
+    cursor: pointer;
+}
+
+.related-item:hover {
+    background: var(--surface-inset);
+}
+
+.related-item:focus-visible {
+    outline: none;
+    box-shadow: var(--shadow-focus);
+}
+
+.related-item.is-current {
+    background: var(--surface-inset);
+    font-weight: 500;
+}
+
+.related-no {
+    flex: none;
+    color: var(--primary);
+}
+
+.related-time,
+.related-len {
+    flex: none;
+    color: var(--text-muted);
+}
+
+.related-info {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* One request or response; responses sit on the other side, like a chat. */
+.message {
+    margin-top: var(--space-sm);
+    padding: var(--space-sm);
+    border-radius: var(--radius-md);
+    background: var(--surface);
+    box-shadow: var(--shadow-sm);
+}
+
+.message.is-response {
+    margin-left: var(--space-lg);
+    background: var(--tertiary);
+}
+
+.message-head {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-sm);
+    align-items: center;
+    margin-bottom: var(--space-xs);
+}
+
+.payload-text,
+.hexdump {
+    max-height: 360px;
+    margin: 0;
+    padding: var(--space-sm);
+    overflow: auto;
+    border-radius: var(--radius-sm);
+    background: var(--surface-inset);
+    color: var(--text);
+    font: 400 12px / 18px var(--font-mono);
+}
+
+.payload-text {
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+.payload-headers {
+    margin-bottom: var(--space-xs);
+}
+
+.hexdump {
+    white-space: pre;
+}
+
+.hexdump .is-header {
+    color: var(--text-muted);
+    opacity: 0.7;
+}
+
+/* ---------- HTTPS proxy ---------- */
+
+/* A full-width line at the end of the toolbar. */
+.mitm-banner {
+    flex-basis: 100%;
+    padding: var(--space-sm) var(--space-md);
+    border-radius: var(--radius-md);
+    background: var(--warning-bg);
+    color: var(--warning-text);
+    font: var(--type-small);
+}
+
+.mitm-banner.is-error {
+    background: var(--error-bg);
+    color: var(--error-text);
+}
+
+.mitm-example code {
+    font: 400 12px / 18px var(--font-mono);
+    word-break: break-all;
+}
+
+.https-list {
+    height: 100%;
+    padding: var(--space-md);
+    overflow-y: auto;
+}
+
+.exchange {
+    margin-bottom: var(--space-sm);
+    border-radius: var(--radius-md);
+    background: var(--wash);
+}
+
+.exchange > summary {
+    display: flex;
+    gap: var(--space-sm);
+    align-items: center;
+    padding: var(--space-sm) var(--space-md);
+    cursor: pointer;
+}
+
+.exchange > summary:focus-visible {
+    border-radius: var(--radius-md);
+    outline: none;
+    box-shadow: var(--shadow-focus);
+}
+
+.exchange[open] {
+    padding-bottom: var(--space-sm);
+}
+
+.exchange > :not(summary) {
+    margin-right: var(--space-md);
+    margin-left: var(--space-md);
+}
+
+.exchange-method {
+    flex: none;
+    color: var(--primary);
+    font: 500 12px / 18px var(--font-mono);
+}
+
+.exchange-url {
+    flex: 1;
+    overflow: hidden;
+    font: 400 12px / 18px var(--font-mono);
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .ontology {

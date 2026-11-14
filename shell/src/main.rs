@@ -6,11 +6,13 @@
 mod capture;
 mod export;
 mod l7;
+mod mitm;
 mod names;
 mod owners;
 mod parse;
 mod ptr;
 mod rdap;
+mod stream;
 
 use std::borrow::Cow;
 use std::io;
@@ -30,6 +32,7 @@ use wry::{WebView, WebViewBuilder, WebViewBuilderExtUnix};
 
 use capture::Capture;
 use export::Recording;
+use mitm::{Exchange, Mitm};
 use names::Names;
 use ptr::{Ptr, PtrInfo};
 use rdap::{DomainInfo, Rdap};
@@ -52,6 +55,19 @@ enum UserEvent {
     Ptr(PtrInfo),
     /// Outcome of a save, shown briefly in the UI.
     Notice(Notice),
+    /// Packet detail the UI asked for.
+    Inspect(Box<stream::Inspection>),
+    /// Request and response decrypted by the HTTPS proxy.
+    Http(Box<Exchange>),
+}
+
+/// State of the HTTPS proxy, as the UI shows it.
+#[derive(Serialize)]
+struct MitmState {
+    on: bool,
+    addr: &'static str,
+    ca: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -79,6 +95,8 @@ struct App {
     names: Names,
     rdap: Rdap,
     ptr: Ptr,
+    /// HTTPS proxy, while the user has it on.
+    mitm: Option<Mitm>,
     /// Open save dialog. GTK drops a native dialog that nothing holds.
     dialog: Option<gtk::FileChooserNative>,
     status: Status,
@@ -133,6 +151,7 @@ fn main() -> wry::Result<()> {
         names: Names::default(),
         rdap,
         ptr,
+        mitm: None,
         dialog: None,
         status: Status {
             state: "pending",
@@ -146,6 +165,8 @@ fn main() -> wry::Result<()> {
             Event::UserEvent(UserEvent::Ipc(msg)) => app.handle_ipc(&msg),
             Event::UserEvent(UserEvent::Domain(info)) => emit(&app.webview, "domain", &info),
             Event::UserEvent(UserEvent::Ptr(info)) => emit(&app.webview, "ptr", &info),
+            Event::UserEvent(UserEvent::Inspect(i)) => emit(&app.webview, "inspect", &i),
+            Event::UserEvent(UserEvent::Http(ex)) => emit(&app.webview, "http", &ex),
             Event::UserEvent(UserEvent::Notice(n)) => {
                 app.dialog = None;
                 emit(&app.webview, "notice", &n);
@@ -162,8 +183,10 @@ fn main() -> wry::Result<()> {
                 ..
             } => {
                 app.capture = None;
-                // tao may exit without dropping the app: delete the pcap file now.
+                // tao may exit without dropping the app: delete the pcap
+                // and CA files now.
                 app.recording = None;
+                app.mitm = None;
                 *control_flow = ControlFlow::Exit;
                 return;
             }
@@ -180,8 +203,15 @@ fn main() -> wry::Result<()> {
 impl App {
     /// IPC messages from the UI: `hello`, `start <interface>`, `stop`,
     /// `save-pcap`, `save <file name>` with the file contents on the
-    /// following lines, or `ptr <address>...` for reverse DNS names.
+    /// following lines, `ptr <address>...` for reverse DNS names,
+    /// `inspect <packet number>`, or `mitm on` / `mitm off`.
     fn handle_ipc(&mut self, msg: &str) {
+        if let Some(no) = msg.strip_prefix("inspect ") {
+            return self.inspect(no);
+        }
+        if let Some(on) = msg.strip_prefix("mitm ") {
+            return self.set_mitm(on == "on");
+        }
         if msg == "hello" {
             // The page may load after the authorization finished: resend the state.
             emit(&self.webview, "status", &self.status);
@@ -250,6 +280,51 @@ impl App {
             self.capture = None;
             self.set_status("error", text);
         }
+    }
+
+    /// Reads the packet and its conversation from the recording on a
+    /// thread: a long capture takes a while to scan.
+    fn inspect(&self, no: &str) {
+        let (Some(rec), Ok(no)) = (self.recording.clone(), no.parse()) else {
+            return self.notice(false, "no recorded packet to inspect".to_owned());
+        };
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            // Fails only when the event loop is gone, i.e. during exit.
+            let _ = proxy.send_event(match stream::inspect(&rec, no) {
+                Ok(i) => UserEvent::Inspect(Box::new(i)),
+                Err(e) => UserEvent::Notice(Notice {
+                    ok: false,
+                    text: format!("cannot inspect packet {no}: {e}"),
+                }),
+            });
+        });
+    }
+
+    fn set_mitm(&mut self, on: bool) {
+        // Dropping the proxy stops it and deletes its CA file.
+        self.mitm = None;
+        let mut state = MitmState {
+            on: false,
+            addr: mitm::ADDR,
+            ca: None,
+            error: None,
+        };
+        if on {
+            let proxy = self.proxy.clone();
+            // Fails only when the event loop is gone, i.e. during exit.
+            match Mitm::start(move |ex| drop(proxy.send_event(UserEvent::Http(Box::new(ex))))) {
+                Ok(m) => {
+                    state.on = true;
+                    state.ca = Some(m.ca_path.display().to_string());
+                    self.mitm = Some(m);
+                }
+                Err(e) => {
+                    state.error = Some(format!("cannot start the proxy on {}: {e}", mitm::ADDR))
+                }
+            }
+        }
+        emit(&self.webview, "mitm", &state);
     }
 
     fn set_status(&mut self, state: &'static str, text: String) {
