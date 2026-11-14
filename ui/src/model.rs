@@ -266,6 +266,15 @@ pub struct Exchange {
     pub resp_headers: Vec<(String, String)>,
     pub resp_body: Body,
     pub error: Option<String>,
+    /// How a connection that is not HTTP was handled.
+    #[serde(default)]
+    pub note: Option<String>,
+    /// Still open: a later event with the same id replaces this one.
+    #[serde(default)]
+    pub open: bool,
+    /// Program that opened the connection.
+    #[serde(default)]
+    pub app: Option<String>,
     pub client: String,
     /// Proxy and server ends of the proxy's connection to the server.
     pub local: Option<String>,
@@ -300,6 +309,21 @@ pub fn is_text(data: &[u8]) -> bool {
         .filter(|&c| c == '\u{fffd}' || c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
         .count();
     odd * 50 <= s.chars().count()
+}
+
+/// Bytes as a string: UTF-8 where it is valid, every other byte and every
+/// control character except line breaks and tabs as `·`.
+pub fn printable(data: &[u8]) -> String {
+    String::from_utf8_lossy(data)
+        .chars()
+        .map(|c| {
+            if c == '\u{fffd}' || c.is_control() && !matches!(c, '\n' | '\r' | '\t') {
+                '·'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// Hex dump lines: offset (counted from `base`), 16 hex byte pairs and
@@ -1279,6 +1303,10 @@ mod tests {
     fn text_and_hex() {
         assert!(is_text(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"));
         assert!(!is_text(&[0x16, 3, 1, 0, 0xa5, 1, 0, 0]));
+        assert_eq!(
+            printable(b"SSH-2.0\r\n\x00\x16\xff\xc3\xa9"),
+            "SSH-2.0\r\n···é"
+        );
         assert_eq!(
             hexdump(b"0123456789abcdefg\x01", 32),
             [

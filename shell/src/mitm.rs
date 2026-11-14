@@ -1,17 +1,26 @@
-//! HTTPS interception: a transparent proxy that decrypts the web traffic
-//! the kernel redirects to it, with certificates signed by a CA made when
-//! interception starts.
+//! HTTPS interception: a transparent proxy for all of this machine's
+//! outgoing TCP, which decrypts TLS with certificates signed by a CA made
+//! when interception starts.
 //!
-//! Clients are not configured. The helper redirects this machine's TCP to
-//! ports 80 and 443 to `PORT` and adds the CA to the system trust store;
-//! the proxy reads where each connection was going (`SO_ORIGINAL_DST`) and
-//! the host name from the TLS server name or the `Host` header. Its own
+//! Clients are not configured. The helper redirects all outgoing TCP to
+//! `PORT` and adds the CA to the system trust store; the proxy reads where
+//! each connection was going (`SO_ORIGINAL_DST`) and tells the protocol
+//! from the client's first bytes:
+//! - TLS on any port is decrypted, with the host name from the server
+//!   name; HTTP/1.1 inside is parsed into requests, other protocols are
+//!   recorded as two byte streams;
+//! - a TLS hello rustls cannot take (old versions) and programs that
+//!   rejected the CA once are passed through undecrypted, so they keep
+//!   working;
+//! - plain HTTP is parsed; anything else is relayed and recorded as is.
+//!
+//! Its own
 //! connections to the servers use sockets marked so the redirect skips
 //! them. The CA key lives only in memory, so the certificate is worthless
 //! once the proxy stops. The proxy checks each server's real certificate
 //! against the Mozilla roots, so it never hides a forged server.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
@@ -33,10 +42,35 @@ use rustls::{StreamOwned, crypto::ring};
 use serde::Serialize;
 use socket2::{SockAddr, SockRef, Socket};
 
+use crate::owners::Owners;
+
 pub use crate::helper_proto::PROXY_PORT as PORT;
 
 /// TLS record type of a handshake: the first byte a TLS client sends.
 const TLS_HANDSHAKE: u8 = 0x16;
+/// ALPN name of the only protocol whose messages the proxy parses.
+const HTTP1: &[u8] = b"http/1.1";
+/// Client bytes looked at to tell the protocol.
+const SNIFF: usize = 8;
+/// After one side of a relayed connection is done, how long the other may
+/// stay silent before the connection is closed. A peer that never answers
+/// a half-close would otherwise hold it open.
+const LINGER: Duration = Duration::from_secs(10);
+/// How long to wait for the client to speak first. Server-first protocols
+/// (SSH, SMTP, FTP) send nothing until the server greets them.
+const CLIENT_FIRST: Duration = Duration::from_millis(300);
+/// Request lines that mark plain HTTP.
+const METHODS: [&[u8]; 9] = [
+    b"GET ",
+    b"POST ",
+    b"PUT ",
+    b"HEAD ",
+    b"DELETE ",
+    b"OPTIONS ",
+    b"PATCH ",
+    b"CONNECT ",
+    b"TRACE ",
+];
 /// Body bytes kept for display, before and after decompression.
 const BODY_MAX: usize = 64 * 1024;
 /// Longest request or response head.
@@ -69,6 +103,14 @@ pub struct Exchange {
     pub resp_body: Body,
     /// Why the exchange failed, if it did.
     pub error: Option<String>,
+    /// How a connection that is not HTTP was handled, such as passed
+    /// through undecrypted.
+    pub note: Option<String>,
+    /// The connection is still open: a later event with the same id
+    /// replaces this one.
+    pub open: bool,
+    /// Process that opened the connection, when it is readable.
+    pub app: Option<String>,
     /// Client end of the client-to-proxy connection.
     pub client: String,
     /// Proxy end and server end of the proxy-to-server connection, to match
@@ -112,6 +154,11 @@ struct Shared {
     stop: Arc<AtomicBool>,
     emit: Box<dyn Fn(Exchange) + Send + Sync>,
     ids: AtomicU64,
+    owners: Mutex<Owners>,
+    /// Programs (or, when the program is unknown, host names) whose TLS
+    /// handshake with the proxy failed: their connections pass through
+    /// undecrypted, so a client that does not trust the CA keeps working.
+    untrusting: Mutex<HashSet<String>>,
 }
 
 impl Mitm {
@@ -145,8 +192,8 @@ impl Mitm {
             .map_err(io::Error::other)?
             .with_root_certificates(roots)
             .with_no_client_auth();
-        // HTTP/2 frames are not parsed: both sides speak HTTP/1.1.
-        upstream.alpn_protocols = vec![b"http/1.1".to_vec()];
+        // Each connection sets the ALPN list its client offered.
+        upstream.alpn_protocols = Vec::new();
         let stop = Arc::new(AtomicBool::new(false));
         let ca_pem = ca.pem();
         let shared = Arc::new(Shared {
@@ -157,6 +204,8 @@ impl Mitm {
             stop: Arc::clone(&stop),
             emit: Box::new(emit),
             ids: AtomicU64::new(0),
+            owners: Mutex::default(),
+            untrusting: Mutex::default(),
         });
         std::thread::spawn(move || accept_loop(&listeners, &shared));
         Ok(Self {
@@ -230,54 +279,35 @@ struct Target {
     authority: String,
 }
 
-fn serve(mut stream: TcpStream, peer: SocketAddr, conn: u64, shared: &Shared) -> io::Result<()> {
+fn serve(stream: TcpStream, peer: SocketAddr, conn: u64, shared: &Shared) -> io::Result<()> {
+    // The client's socket exists by now: it was accepted.
+    let since = Instant::now();
     stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(IDLE))?;
     let dst = original_dst(&stream)?;
+    let app = shared
+        .owners
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .tcp_owner(peer.ip(), peer.port(), since);
     let base = Exchange {
         conn,
+        app,
         client: peer.to_string(),
         ..Exchange::default()
     };
-    let mut first = [0u8; 1];
-    if stream.peek(&mut first)? == 0 {
-        return Ok(());
-    }
-    if first[0] == TLS_HANDSHAKE {
-        // Read the ClientHello first: its server name picks the certificate.
-        let mut acceptor = Acceptor::default();
-        let accepted = loop {
-            if acceptor.read_tls(&mut stream)? == 0 {
-                return Ok(());
-            }
-            match acceptor.accept() {
-                Ok(Some(a)) => break a,
-                Ok(None) => {}
-                Err((e, mut alert)) => {
-                    let _ = alert.write_all(&mut stream);
-                    return Err(io::Error::other(e));
-                }
-            }
-        };
-        let host = accepted
-            .client_hello()
-            .server_name()
-            .map_or_else(|| dst.ip().to_string(), str::to_owned);
-        let config = shared.host_config(&host)?;
-        let tls = match accepted.into_connection(config) {
-            Ok(c) => StreamOwned::new(c, stream),
-            Err((e, mut alert)) => {
-                let _ = alert.write_all(&mut stream);
-                return Err(io::Error::other(e));
-            }
-        };
-        let server = connect_tls(dst, &host, shared);
-        let target = Target {
-            scheme: "https",
-            authority: authority(&host, dst.port(), 443),
-        };
-        exchanges(BufReader::new(tls), server, None, &target, base, shared)
-    } else {
+    stream.set_read_timeout(Some(CLIENT_FIRST))?;
+    let mut first = [0u8; SNIFF];
+    let n = match stream.peek(&mut first) {
+        Ok(0) => return Ok(()),
+        Ok(n) => n,
+        Err(e) if is_timeout(&e) => 0,
+        Err(e) => return Err(e),
+    };
+    stream.set_read_timeout(Some(IDLE))?;
+    let first = &first[..n];
+    if first.first() == Some(&TLS_HANDSHAKE) {
+        serve_tls(stream, dst, base, shared)
+    } else if is_http_request(first) {
         let mut client = BufReader::new(stream);
         let Some(head) = read_head(&mut client)? else {
             return Ok(());
@@ -292,6 +322,318 @@ fn serve(mut stream: TcpStream, peer: SocketAddr, conn: u64, shared: &Shared) ->
         };
         let server = connect(dst, shared).map(BufReader::new);
         exchanges(client, server, Some(head), &target, base, shared)
+    } else {
+        // Any other protocol, or one where the server speaks first.
+        let ex = Exchange {
+            method: "TCP".to_owned(),
+            url: format!("tcp://{}", authority(&dst.ip().to_string(), dst.port(), 0)),
+            ..base
+        };
+        pass_through(stream, dst, &[], ex, true, shared)
+    }
+}
+
+/// Reads the ClientHello, then decrypts with a certificate for its server
+/// name, or passes the connection through untouched when the hello cannot
+/// be read or the program already rejected the CA.
+fn serve_tls(
+    mut stream: TcpStream,
+    dst: SocketAddr,
+    base: Exchange,
+    shared: &Shared,
+) -> io::Result<()> {
+    let mut tee = Tee {
+        inner: &mut stream,
+        seen: Vec::new(),
+    };
+    let mut acceptor = Acceptor::default();
+    let accepted = loop {
+        if acceptor.read_tls(&mut tee)? == 0 {
+            return Ok(());
+        }
+        match acceptor.accept() {
+            Ok(Some(a)) => break Ok(a),
+            Ok(None) => {}
+            Err((e, _)) => break Err(e),
+        }
+    };
+    let seen = tee.seen;
+    let mut ex = Exchange {
+        method: "TLS".to_owned(),
+        url: format!("tls://{}", authority(&dst.ip().to_string(), dst.port(), 0)),
+        ..base
+    };
+    let accepted = match accepted {
+        Ok(a) => a,
+        Err(e) => {
+            // TLS versions or extensions rustls does not take: relay as is.
+            ex.note = Some(format!("not decrypted: unreadable TLS hello ({e})"));
+            return pass_through(stream, dst, &seen, ex, false, shared);
+        }
+    };
+    let hello = accepted.client_hello();
+    let host = hello
+        .server_name()
+        .map_or_else(|| dst.ip().to_string(), str::to_owned);
+    let offered: Vec<Vec<u8>> = hello
+        .alpn()
+        .map(|list| list.map(<[u8]>::to_vec).collect())
+        .unwrap_or_default();
+    ex.url = format!("tls://{}", authority(&host, dst.port(), 0));
+    // The program, or the host when the program is unknown (another user's).
+    let key = ex.app.clone().unwrap_or_else(|| host.clone());
+    let rejected = shared
+        .untrusting
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(&key);
+    if rejected {
+        ex.note = Some(format!(
+            "not decrypted: {key} rejected the interception certificate earlier"
+        ));
+        return pass_through(stream, dst, &seen, ex, false, shared);
+    }
+
+    // HTTP/1.1 alone when the client takes it, since its messages are the
+    // ones parsed; otherwise the client's own list, so h2-only or other
+    // protocols still connect and are relayed decrypted.
+    let wants_http1 = offered.iter().any(|p| p == HTTP1);
+    let alpn = if wants_http1 {
+        vec![HTTP1.to_vec()]
+    } else {
+        offered
+    };
+    let server = connect_tls(dst, &host, alpn, shared);
+    let chosen = match &server {
+        Ok(s) => s.get_ref().conn.alpn_protocol().map(<[u8]>::to_vec),
+        // The client then gets a 502 over HTTP/1.1, or a closed connection.
+        Err(_) => wants_http1.then(|| HTTP1.to_vec()),
+    };
+    let mut config = (*shared.host_config(&host)?).clone();
+    config.alpn_protocols = chosen.iter().cloned().collect();
+    let conn = match accepted.into_connection(Arc::new(config)) {
+        Ok(c) => c,
+        Err((e, _)) => {
+            // Nothing went to the client yet: let the real server answer
+            // a hello rustls will not (old versions or ciphers).
+            drop(server);
+            ex.note = Some(format!("not decrypted: {e}"));
+            return pass_through(stream, dst, &seen, ex, false, shared);
+        }
+    };
+    let mut tls = StreamOwned::new(conn, stream);
+    // Finish the handshake here: this is where a client that does not
+    // trust the CA fails. Its next connections pass through.
+    while tls.conn.is_handshaking() {
+        if let Err(e) = tls.conn.complete_io(&mut tls.sock) {
+            shared
+                .untrusting
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(key.clone());
+            ex.error = Some(format!(
+                "{key} does not trust the interception certificate ({e}); \
+                 its next connections pass through undecrypted"
+            ));
+            shared.emit_new(ex);
+            return Ok(());
+        }
+    }
+    let http = chosen.as_deref() == Some(HTTP1) || (chosen.is_none() && is_web_port(dst.port()));
+    if http {
+        let target = Target {
+            scheme: "https",
+            authority: authority(&host, dst.port(), 443),
+        };
+        return exchanges(
+            BufReader::new(tls),
+            server,
+            None,
+            &target,
+            ex_base(ex),
+            shared,
+        );
+    }
+    let mut server = match server {
+        Ok(s) => s,
+        Err(e) => {
+            ex.error = Some(format!("cannot reach {host}: {e}"));
+            shared.emit_new(ex);
+            return Ok(());
+        }
+    };
+    if let Some(p) = &chosen {
+        ex.note = Some(format!("decrypted, {}", String::from_utf8_lossy(p)));
+    }
+    let mut client = BufReader::new(tls);
+    ex.local = server
+        .get_ref()
+        .tcp()
+        .local_addr()
+        .ok()
+        .map(|a| a.to_string());
+    ex.remote = server
+        .get_ref()
+        .tcp()
+        .peer_addr()
+        .ok()
+        .map(|a| a.to_string());
+    let started = Instant::now();
+    let id = shared.emit_new(Exchange {
+        open: true,
+        ..ex.clone()
+    });
+    let result = tunnel(
+        &mut client,
+        &mut server,
+        (&mut ex.req_body, &mut ex.resp_body),
+        true,
+    );
+    shared.emit_end(id, ex, started);
+    result
+}
+
+/// The fields of a TLS connection's record that its HTTP exchanges share.
+fn ex_base(ex: Exchange) -> Exchange {
+    Exchange {
+        conn: ex.conn,
+        app: ex.app,
+        client: ex.client,
+        ..Exchange::default()
+    }
+}
+
+/// Ports where a TLS client without ALPN speaks HTTP.
+fn is_web_port(port: u16) -> bool {
+    matches!(port, 443 | 4443 | 8443)
+}
+
+fn is_http_request(first: &[u8]) -> bool {
+    // A short read is an HTTP prefix when a method starts with it.
+    first.len() >= 3
+        && METHODS
+            .iter()
+            .any(|m| m.starts_with(first) || first.starts_with(m))
+}
+
+fn is_timeout(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
+/// Reader that keeps a copy of what it reads, to replay it upstream.
+struct Tee<'a> {
+    inner: &'a mut TcpStream,
+    seen: Vec<u8>,
+}
+
+impl Read for Tee<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.seen.extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+}
+
+/// Connects to the server and relays bytes both ways unchanged, after
+/// sending `seen` (client bytes already read). `keep` records the first
+/// bytes of each direction; it is off for ciphertext.
+fn pass_through(
+    client: TcpStream,
+    dst: SocketAddr,
+    seen: &[u8],
+    mut ex: Exchange,
+    keep: bool,
+    shared: &Shared,
+) -> io::Result<()> {
+    let server = match connect(dst, shared).and_then(|s| (&s).write_all(seen).map(|()| s)) {
+        Ok(s) => s,
+        Err(e) => {
+            ex.error = Some(format!("cannot reach {dst}: {e}"));
+            shared.emit_new(ex);
+            return Ok(());
+        }
+    };
+    ex.local = server.local_addr().ok().map(|a| a.to_string());
+    ex.remote = server.peer_addr().ok().map(|a| a.to_string());
+    record(&mut ex.req_body, seen, keep);
+    let started = Instant::now();
+    let id = shared.emit_new(Exchange {
+        open: true,
+        ..ex.clone()
+    });
+    // Sessions such as SSH may stay idle for hours.
+    client.set_read_timeout(None)?;
+    server.set_read_timeout(None)?;
+    let (c, s) = (client.try_clone()?, server.try_clone()?);
+    let last = Arc::new(AtomicU64::new(now_ms()));
+    let down_done = Arc::new(AtomicBool::new(false));
+    let (last_up, down_done_up) = (Arc::clone(&last), Arc::clone(&down_done));
+    let mut up = std::mem::take(&mut ex.req_body);
+    let upward = std::thread::spawn(move || {
+        copy(&c, &s, &mut up, keep, &last_up);
+        // The client is done; a server that stays silent is closed after LINGER.
+        linger(&last_up, || down_done_up.load(Ordering::Relaxed), &s);
+        up
+    });
+    copy(&server, &client, &mut ex.resp_body, keep, &last);
+    down_done.store(true, Ordering::Relaxed);
+    // The server is done; a client that stays silent is closed after LINGER.
+    linger(&last, || upward.is_finished(), &client);
+    ex.req_body = upward.join().unwrap_or_default();
+    shared.emit_end(id, ex, started);
+    Ok(())
+}
+
+/// Waits until `finished`, or until nothing moved for `LINGER`, and then
+/// closes `sock` so the copy still reading from it ends.
+fn linger(last: &AtomicU64, finished: impl Fn() -> bool, sock: &TcpStream) {
+    while !finished() {
+        if now_ms().saturating_sub(last.load(Ordering::Relaxed)) > LINGER.as_millis() as u64 {
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Copies `from` to `to` until `from` ends, then half-closes `to`. A
+/// failure on either side closes both, so the other direction ends too.
+/// `last` takes the time of each transfer.
+fn copy(from: &TcpStream, to: &TcpStream, body: &mut Body, keep: bool, last: &AtomicU64) {
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match (&*from).read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if (&*to).write_all(&buf[..n]).is_err() {
+                    let _ = from.shutdown(std::net::Shutdown::Both);
+                    break;
+                }
+                last.store(now_ms(), Ordering::Relaxed);
+                record(body, &buf[..n], keep);
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                let _ = to.shutdown(std::net::Shutdown::Both);
+                return;
+            }
+        }
+    }
+    let _ = to.shutdown(std::net::Shutdown::Write);
+}
+
+/// Counts `data` into `body`, and keeps it up to `BODY_MAX` when `keep`.
+fn record(body: &mut Body, data: &[u8], keep: bool) {
+    body.size += data.len();
+    if keep {
+        let room = BODY_MAX.saturating_sub(body.data.len()).min(data.len());
+        body.data.extend_from_slice(&data[..room]);
+        body.truncated |= room < data.len();
+    } else {
+        body.truncated = body.size > 0;
     }
 }
 
@@ -314,6 +656,26 @@ fn original_dst(stream: &TcpStream) -> io::Result<SocketAddr> {
 }
 
 impl Shared {
+    /// Emits a new record and returns its id.
+    fn emit_new(&self, mut ex: Exchange) -> u64 {
+        ex.id = self.ids.fetch_add(1, Ordering::Relaxed) + 1;
+        ex.at_ms = now_ms();
+        let id = ex.id;
+        (self.emit)(ex);
+        id
+    }
+
+    /// Emits the final state of the record `id`, opened at `started`.
+    fn emit_end(&self, id: u64, ex: Exchange, started: Instant) {
+        (self.emit)(Exchange {
+            id,
+            at_ms: now_ms().saturating_sub(elapsed_ms(started)),
+            ms: elapsed_ms(started),
+            open: false,
+            ..ex
+        });
+    }
+
     /// Server configuration with a certificate for `host`, made once per host.
     fn host_config(&self, host: &str) -> io::Result<Arc<ServerConfig>> {
         let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
@@ -381,16 +743,18 @@ fn connect(dst: SocketAddr, shared: &Shared) -> io::Result<TcpStream> {
 }
 
 /// TLS connection to the real server, with its certificate checked for
-/// the name the client asked for.
+/// the name the client asked for, offering the `alpn` protocols.
 fn connect_tls(
     dst: SocketAddr,
     host: &str,
+    alpn: Vec<Vec<u8>>,
     shared: &Shared,
 ) -> io::Result<BufReader<StreamOwned<ClientConnection, TcpStream>>> {
     let tcp = connect(dst, shared)?;
     let name = ServerName::try_from(host.to_owned()).map_err(io::Error::other)?;
-    let conn =
-        ClientConnection::new(Arc::clone(&shared.upstream), name).map_err(io::Error::other)?;
+    let mut config = (*shared.upstream).clone();
+    config.alpn_protocols = alpn;
+    let conn = ClientConnection::new(Arc::new(config), name).map_err(io::Error::other)?;
     let mut tls = StreamOwned::new(conn, tcp);
     // Handshake now, so a bad server certificate shows as this exchange's error.
     while tls.conn.is_handshaking() {
@@ -530,7 +894,8 @@ fn exchanges<C: Sock, S: Sock>(
         (shared.emit)(ex);
         if resp.status == 101 {
             // An upgraded protocol (WebSocket) is relayed without parsing.
-            return tunnel(&mut client, &mut server);
+            let (mut up, mut down) = (Body::default(), Body::default());
+            return tunnel(&mut client, &mut server, (&mut up, &mut down), false);
         }
         let close = |h: &[(String, String)]| {
             header(h, "connection").is_some_and(|v| v.eq_ignore_ascii_case("close"))
@@ -550,13 +915,23 @@ fn bad_gateway(text: &str) -> String {
     )
 }
 
-/// Copies bytes both ways until either side closes.
-fn tunnel<C: Sock, S: Sock>(a: &mut BufReader<C>, b: &mut BufReader<S>) -> io::Result<()> {
+/// Copies bytes both ways until either side closes, counting (and, when
+/// `keep`, keeping the first bytes of) `a` to `b` in `bodies.0` and `b` to
+/// `a` in `bodies.1`.
+fn tunnel<C: Sock, S: Sock>(
+    a: &mut BufReader<C>,
+    b: &mut BufReader<S>,
+    bodies: (&mut Body, &mut Body),
+    keep: bool,
+) -> io::Result<()> {
     a.get_ref().tcp().set_read_timeout(Some(POLL))?;
     b.get_ref().tcp().set_read_timeout(Some(POLL))?;
     let mut idle = Duration::ZERO;
     while idle < IDLE {
-        match (pump(a, b.get_mut())?, pump(b, a.get_mut())?) {
+        match (
+            pump(a, b.get_mut(), bodies.0, keep)?,
+            pump(b, a.get_mut(), bodies.1, keep)?,
+        ) {
             (None, _) | (_, None) => break,
             (Some(0), Some(0)) => idle += POLL * 2,
             _ => idle = Duration::ZERO,
@@ -567,11 +942,17 @@ fn tunnel<C: Sock, S: Sock>(a: &mut BufReader<C>, b: &mut BufReader<S>) -> io::R
 
 /// Moves what `from` has to `to`: `Some(0)` when nothing came in time,
 /// `None` when `from` closed.
-fn pump(from: &mut BufReader<impl Read>, to: &mut impl Write) -> io::Result<Option<usize>> {
+fn pump(
+    from: &mut BufReader<impl Read>,
+    to: &mut impl Write,
+    body: &mut Body,
+    keep: bool,
+) -> io::Result<Option<usize>> {
     let n = match from.fill_buf() {
         Ok([]) => return Ok(None),
         Ok(buf) => {
             to.write_all(buf)?;
+            record(body, buf, keep);
             buf.len()
         }
         Err(e)
@@ -920,25 +1301,42 @@ mod tests {
         assert_eq!((out, b.data.as_slice()), (gz, &b"hello"[..]));
     }
 
-    /// Runs `nft` with `script` on stdin.
-    fn nft(script: &str) {
-        let mut child = std::process::Command::new("nft")
-            .args(["-f", "-"])
+    /// Loads the helper's rules the way the helper does: the owner-flagged
+    /// table lives as long as the returned `nft -i`.
+    fn hold_rules() -> std::process::Child {
+        let child = std::process::Command::new("nft")
+            .arg("-i")
             .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(script.as_bytes())
+        let mut input = child.stdin.as_ref().unwrap();
+        input
+            .write_all(crate::helper_proto::rules().as_bytes())
             .unwrap();
-        assert!(child.wait().unwrap().success(), "nft failed");
+        std::thread::sleep(Duration::from_millis(500));
+        child
+    }
+
+    /// Ends `nft -i` and checks the kernel dropped its table.
+    fn drop_rules(mut child: std::process::Child) {
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        let out = std::process::Command::new("nft")
+            .args(["list", "tables"])
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("wireshark_rs"),
+            "the table goes with its owner"
+        );
     }
 
     /// Installs the helper's redirect rules, runs a plain curl (no proxy
     /// option) to `MITM_URL` (default `https://example.com/`) and prints
-    /// what the proxy recorded. Needs root in a network namespace, e.g.
+    /// what the proxy recorded. Then checks a protocol where the server
+    /// speaks first (SSH to `MITM_SSH`, default github.com:22) still works.
+    /// Needs root in a network namespace, e.g.
     /// `pasta --config-net -- cargo test ... live_proxy -- --ignored`.
     #[test]
     #[ignore = "network and a root network namespace"]
@@ -957,20 +1355,66 @@ mod tests {
             Ok(s.into())
         });
         let mitm = Mitm::start(connector, move |ex| drop(tx.lock().unwrap().send(ex))).unwrap();
-        nft(&crate::helper_proto::rules());
+        let rules = hold_rules();
         let out = std::process::Command::new("curl")
             .args(["-sS", "--compressed", "--cacert"])
             .arg(&mitm.ca_path)
             .arg(&url)
             .output()
             .unwrap();
-        nft(&crate::helper_proto::remove_rules());
+        // The namespace's trust store lacks the CA, as Firefox's does: the
+        // first try fails, later ones pass through undecrypted.
+        let untrusting = || {
+            std::process::Command::new("curl")
+                .args(["-sS", "-o", "/dev/null", "-w", "%{http_code}"])
+                .arg(&url)
+                .output()
+                .unwrap()
+        };
+        let (first, second) = (untrusting(), untrusting());
+        let ssh = std::env::var("MITM_SSH").unwrap_or_else(|_| "github.com:22".into());
+        let mut banner = [0u8; 4];
+        let greeted = std::net::TcpStream::connect(&ssh).and_then(|mut s| {
+            s.set_read_timeout(Some(Duration::from_secs(10)))?;
+            s.read_exact(&mut banner)
+        });
+        drop_rules(rules);
         assert!(
             out.status.success(),
             "curl: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let ex = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            !first.status.success(),
+            "a client without the CA fails once"
+        );
+        assert_eq!(
+            (second.status.success(), &second.stdout[..]),
+            (true, &b"200"[..]),
+            "then passes through: {}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        greeted.unwrap();
+        assert_eq!(&banner, b"SSH-", "the server greeting passes through");
+        let mut seen: Vec<Exchange> = Vec::new();
+        while let Ok(ex) = rx.recv_timeout(Duration::from_secs(5)) {
+            seen.push(ex);
+        }
+        for ex in &seen {
+            println!(
+                "{} {} open={} app={:?} note={:?} error={:?}",
+                ex.method, ex.url, ex.open, ex.app, ex.note, ex.error
+            );
+        }
+        let raw = seen
+            .iter()
+            .find(|e| e.method == "TCP" && !e.open)
+            .expect("the SSH connection is recorded");
+        assert!(raw.resp_body.data.starts_with(b"SSH-"));
+        let ex = seen
+            .into_iter()
+            .find(|e| e.status.is_some())
+            .expect("an HTTP exchange");
         println!(
             "{} {} -> {:?} {} | body {} B ({:?}) | server {:?} via {:?}\n{}",
             ex.method,

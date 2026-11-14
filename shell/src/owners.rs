@@ -70,6 +70,18 @@ impl Owners {
         [row.sproc, row.dproc] = names;
     }
 
+    /// Process that owns the local TCP socket `ip:port`, which existed at
+    /// `since`. On a miss /proc is scanned again unless a scan started
+    /// after `since`, so a burst of connections costs one scan.
+    pub fn tcp_owner(&mut self, ip: IpAddr, port: u16, since: Instant) -> Option<String> {
+        let found = self.lookup(6, ip, port);
+        if found.is_some() || self.scanned.is_some_and(|t| t >= since) {
+            return found;
+        }
+        self.scan();
+        self.lookup(6, ip, port)
+    }
+
     fn lookup(&self, proto: u8, ip: IpAddr, port: u16) -> Option<String> {
         // Wildcard binds: v4 sockets on 0.0.0.0, and dual-stack sockets on ::.
         let any4 = IpAddr::V4(Ipv4Addr::UNSPECIFIED);

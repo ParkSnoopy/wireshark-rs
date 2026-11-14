@@ -1872,6 +1872,22 @@ body {
     opacity: 0.7;
 }
 
+/* The hex dump stays folded under the string view until asked for. */
+.hex-details {
+    margin-top: var(--space-xs);
+}
+
+.hex-details > summary {
+    width: fit-content;
+    cursor: pointer;
+    color: var(--text-muted);
+    font: 500 12px / 18px var(--font-body);
+}
+
+.hex-details > .hexdump {
+    margin-top: var(--space-xs);
+}
+
 /* ---------- HTTPS proxy ---------- */
 
 /* A full-width line at the end of the toolbar. */

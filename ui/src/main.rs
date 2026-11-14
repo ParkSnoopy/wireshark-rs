@@ -103,7 +103,7 @@ fn App() -> impl IntoView {
     let domains = RwSignal::new(Domains::new());
     // PTR names, and whether to look them up for every address seen.
     let ptrs = RwSignal::new(Ptrs::new());
-    let ptr_on = RwSignal::new(false);
+    let ptr_on = RwSignal::new(true);
     // On by default: under load, repeats of one flow fill the table.
     let collapse = RwSignal::new(true);
     let recent_only = RwSignal::new(false);
@@ -211,6 +211,11 @@ fn App() -> impl IntoView {
     window_event_listener_untyped("http", move |ev| {
         if let Some(e) = detail::<Exchange>(ev) {
             exchanges.update(|x| {
+                // An open connection's record is sent again when it ends.
+                if let Some(old) = x.iter_mut().rev().find(|o| o.id == e.id) {
+                    *old = e;
+                    return;
+                }
                 if x.len() == EXCHANGES_MAX {
                     x.remove(0);
                 }
@@ -357,7 +362,7 @@ fn App() -> impl IntoView {
                         type="button"
                         class="chip chip-filter mitm-toggle"
                         aria-pressed=move || mitm.with(|m| m.on).to_string()
-                        title="Intercept and decrypt this machine's web traffic: redirects TCP 80 and 443 to this app and trusts its certificate system-wide while on. Off by default."
+                        title="Intercept this machine's outgoing TCP and decrypt TLS on any port: redirects all TCP to this app and trusts its certificate system-wide while on. Off by default."
                         on:click=move |_| {
                             let on = !mitm.with_untracked(|m| m.on);
                             post_message(if on { "mitm on" } else { "mitm off" });
@@ -647,9 +652,11 @@ fn MitmBanner(mitm: RwSignal<MitmState>) -> impl IntoView {
                 <div class="mitm-banner" role="status">
                     <p>
                         <strong>"HTTPS interception is on."</strong>
-                        " All web traffic of this machine (TCP ports 80 and 443) goes through this app, which can read it. "
+                        " All outgoing TCP of this machine goes through this app, which can read it. "
                         "Its certificate is trusted system-wide until you turn this off or close the app; its key never leaves memory. "
-                        "QUIC is blocked so browsers use TCP."
+                        "QUIC is blocked so browsers use TCP. "
+                        "A program that rejects the certificate (Firefox and Chrome use their own lists) fails once, "
+                        "then its connections pass through undecrypted. Import the certificate below to decrypt them too."
                     </p>
                     <p class="mitm-example">
                         "Certificate: " <code>{ca}</code>

@@ -195,9 +195,15 @@ fn main() -> wry::Result<()> {
             } => {
                 app.capture = None;
                 // tao may exit without dropping the app: delete the pcap
-                // and CA files and undo interception now.
+                // and CA files and undo interception now. The explicit
+                // `off` waits for the helper; closing the connection would
+                // also make it clean up, but without waiting.
                 app.recording = None;
-                app.mitm = None;
+                if app.mitm.take().is_some()
+                    && let Some(Err(e)) = app.helper.as_ref().map(|h| h.intercept_off())
+                {
+                    eprintln!("cannot undo interception: {e}");
+                }
                 app.helper = None;
                 *control_flow = ControlFlow::Exit;
                 return;

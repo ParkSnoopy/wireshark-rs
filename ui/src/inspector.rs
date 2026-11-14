@@ -5,7 +5,8 @@
 use leptos::prelude::*;
 
 use crate::model::{
-    Body, Exchange, Inspection, Ptrs, Row, Turn, bytes, duration, hexdump, is_text, ptr_of,
+    Body, Exchange, Inspection, Ptrs, Row, Turn, bytes, duration, hexdump, is_text, printable,
+    ptr_of,
 };
 
 /// Bytes shown as a hex dump before the rest is left out.
@@ -247,7 +248,7 @@ fn messages(
     let proxy_view = (!proxied.is_empty()).then(|| {
         view! {
             <section class="inspector-section">
-                <h4>"Decrypted by the HTTPS proxy"</h4>
+                <h4>"Through the interception proxy"</h4>
                 {proxied.into_iter().map(|e| view! { <ExchangeView ex=e open=true /> }).collect_view()}
             </section>
         }
@@ -309,13 +310,25 @@ fn turn(t: Turn, jump: Callback<u64>) -> impl IntoView {
     }
 }
 
-/// Text as text, anything else as a hex dump.
+/// The bytes as a string, with the hex dump folded away below.
 fn data_view(data: &[u8]) -> impl IntoView + use<> {
-    if is_text(data) {
-        view! { <pre class="payload-text">{String::from_utf8_lossy(data).into_owned()}</pre> }
-            .into_any()
-    } else {
-        hex_view(data, 0, 0).into_any()
+    let note = (!is_text(data)).then(|| {
+        view! { <p class="inspector-note">"Mostly binary: unreadable bytes show as ·."</p> }
+    });
+    view! {
+        {note}
+        <pre class="payload-text">{printable(data)}</pre>
+        {hex_details(data, 0)}
+    }
+}
+
+/// Hex dump in a closed disclosure, so the string view comes first.
+fn hex_details(data: &[u8], mark: usize) -> impl IntoView + use<> {
+    view! {
+        <details class="hex-details">
+            <summary>"Hex"</summary>
+            {hex_view(data, 0, mark)}
+        </details>
     }
 }
 
@@ -359,14 +372,17 @@ fn payload(detail: Option<Inspection>) -> impl IntoView + use<> {
                 {cut}
             </p>
             {data.is_empty().then(|| view! { <p class="inspector-note">"This packet carries no payload."</p> })}
-            {(!data.is_empty() && is_text(data)).then(|| view! {
-                <pre class="payload-text">{String::from_utf8_lossy(data).into_owned()}</pre>
+            {(!data.is_empty()).then(|| view! {
+                {(!is_text(data)).then(|| view! {
+                    <p class="inspector-note">"Mostly binary: unreadable bytes show as ·."</p>
+                })}
+                <pre class="payload-text">{printable(data)}</pre>
             })}
         </section>
         <section class="inspector-section">
             <h4>"Packet bytes"</h4>
             <p class="inspector-note">"From the IP header on. Header lines are muted."</p>
-            {hex_view(&d.bytes, 0, at)}
+            {hex_details(&d.bytes, at)}
         </section>
     }
     .into_any()
@@ -375,16 +391,27 @@ fn payload(detail: Option<Inspection>) -> impl IntoView + use<> {
 /// One decrypted request and its response.
 #[component]
 pub fn ExchangeView(ex: Exchange, #[prop(optional)] open: bool) -> impl IntoView {
+    // TLS and TCP rows are whole connections relayed as bytes.
+    let relayed = ex.status.is_none() && matches!(ex.method.as_str(), "TLS" | "TCP");
     let status = match (&ex.error, ex.status) {
         (Some(_), _) => "failed".to_owned(),
         (None, Some(s)) => format!("{s} {}", ex.reason),
+        (None, None) if ex.open => "open".to_owned(),
+        (None, None) if relayed => "closed".to_owned(),
         (None, None) => "no response".to_owned(),
     };
     let tone = match ex.status {
         _ if ex.error.is_some() => "chip-error",
         Some(s) if s >= 400 => "chip-warning",
         Some(_) => "chip-success",
+        None if ex.open => "chip-info",
+        None if relayed => "",
         None => "chip-error",
+    };
+    let time = if ex.open {
+        String::new()
+    } else {
+        format!("{} ms", ex.ms)
     };
     view! {
         <details class="exchange" open=open>
@@ -392,11 +419,21 @@ pub fn ExchangeView(ex: Exchange, #[prop(optional)] open: bool) -> impl IntoView
                 <span class="exchange-method">{ex.method.clone()}</span>
                 <span class="exchange-url">{ex.url.clone()}</span>
                 <span class=format!("chip {tone}")>{status}</span>
-                <span class="inspector-note">{format!("{} ms", ex.ms)}</span>
+                {ex.app.clone().map(|a| view! { <span class="chip">{a}</span> })}
+                <span class="inspector-note">{time}</span>
             </summary>
             {ex.error.clone().map(|e| view! { <p class="tip-flag">{e}</p> })}
-            {message_part("Request", &ex.req_headers, &ex.req_body)}
-            {ex.status.is_some().then(|| message_part("Response", &ex.resp_headers, &ex.resp_body))}
+            {ex.note.clone().map(|n| view! { <p class="inspector-note">{n}</p> })}
+            {message_part(
+                if relayed { "Client → server" } else { "Request" },
+                &ex.req_headers,
+                &ex.req_body,
+            )}
+            {(ex.status.is_some() || relayed).then(|| message_part(
+                if relayed { "Server → client" } else { "Response" },
+                &ex.resp_headers,
+                &ex.resp_body,
+            ))}
         </details>
     }
 }
@@ -408,15 +445,17 @@ fn message_part(
 ) -> impl IntoView + use<> {
     let mut facts = vec![format!("body {}", bytes(body.size as u64))];
     facts.extend(body.note.clone());
-    if body.truncated {
+    // Ciphertext passed through is counted, not kept.
+    if body.truncated && !body.data.is_empty() {
         facts.push(format!("first {} shown", bytes(body.data.len() as u64)));
     }
     let head: String = headers.iter().map(|(n, v)| format!("{n}: {v}\n")).collect();
     let data = body.data.clone();
+    let request = matches!(label, "Request" | "Client → server");
     view! {
-        <div class="message" class:is-response=label == "Response">
+        <div class="message" class:is-response=!request>
             <p class="message-head">
-                <span class="chip" class:chip-info=label == "Request">{label}</span>
+                <span class="chip" class:chip-info=request>{label}</span>
                 <span class="inspector-note">{facts.join(" · ")}</span>
             </p>
             {(!head.is_empty()).then(|| view! { <pre class="payload-text payload-headers">{head}</pre> })}
