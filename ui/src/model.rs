@@ -419,6 +419,50 @@ pub fn scope(addr: &str) -> Option<Scope> {
     }
 }
 
+/// What Shodan (`InternetDB`) knows about a public address, as the shell
+/// sends it. The lists are empty when `found` is false.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct ShodanInfo {
+    pub ip: String,
+    pub ports: Vec<u16>,
+    pub hostnames: Vec<String>,
+    pub cpes: Vec<String>,
+    pub tags: Vec<String>,
+    pub vulns: Vec<String>,
+    pub found: bool,
+    pub error: Option<String>,
+}
+
+impl ShodanInfo {
+    /// Label and text of each fact, for the node inspector.
+    pub fn facts(&self) -> Vec<(&'static str, String)> {
+        if let Some(e) = &self.error {
+            return vec![("Shodan", format!("lookup failed: {e}"))];
+        }
+        if !self.found {
+            return vec![("Shodan", "no data on this address".to_owned())];
+        }
+        let list = |items: &[String]| {
+            if items.is_empty() {
+                "none".to_owned()
+            } else {
+                items.join(", ")
+            }
+        };
+        let ports: Vec<String> = self.ports.iter().map(ToString::to_string).collect();
+        vec![
+            ("Open ports", list(&ports)),
+            ("Host names", list(&self.hostnames)),
+            ("Software", list(&self.cpes)),
+            ("Tags", list(&self.tags)),
+            ("Vulns", list(&self.vulns)),
+        ]
+    }
+}
+
+/// Shodan answers by address.
+pub type Shodans = HashMap<IpAddr, ShodanInfo>;
+
 /// Reverse DNS answers by address: `None` when the address has no PTR record.
 pub type Ptrs = HashMap<IpAddr, Option<String>>;
 
@@ -1587,6 +1631,21 @@ mod tests {
         assert!(out.starts_with("no,time,source,"));
         assert!(line.ends_with(",\"'=HYPERLINK(\"\"x\"\"), b\""), "{line}");
         assert_eq!(line.split(',').next(), Some("1"));
+    }
+
+    #[test]
+    fn shodan_facts_say_what_is_known() {
+        let info = ShodanInfo {
+            ports: vec![53, 443],
+            tags: vec!["cdn".to_owned()],
+            found: true,
+            ..ShodanInfo::default()
+        };
+        let list = info.facts();
+        assert_eq!(list.first(), Some(&("Open ports", "53, 443".to_owned())));
+        assert!(list.contains(&("Vulns", "none".to_owned())));
+        let missing = ShodanInfo::default().facts();
+        assert_eq!(missing, [("Shodan", "no data on this address".to_owned())]);
     }
 
     #[test]

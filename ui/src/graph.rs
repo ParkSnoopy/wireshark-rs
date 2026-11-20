@@ -10,13 +10,17 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
+use std::net::IpAddr;
 
 use leptos::ev::{KeyboardEvent, MouseEvent, PointerEvent, WheelEvent};
 use leptos::prelude::*;
 use leptos::svg::Svg;
 use wasm_bindgen::JsCast;
 
-use crate::model::{DomainInfo, Domains, Graph, Node, Part, Ptrs, Rel, Scope, bytes, ptr_of};
+use crate::model::{
+    DomainInfo, Domains, Graph, Node, Part, Ptrs, Rel, Scope, ShodanInfo, Shodans, bytes, ptr_of,
+};
+use crate::post_message;
 use crate::tip::{Card, facts, tip};
 
 /// Build log entries rendered, newest first.
@@ -431,6 +435,8 @@ struct Page {
     /// Registration data of host names, for the recent-domain mark.
     domains: RwSignal<Domains>,
     ptrs: RwSignal<Ptrs>,
+    /// Shodan answers for the addresses the user looked up.
+    shodan: RwSignal<Shodans>,
     layout: Layout,
     camera: RwSignal<Camera>,
     selected: RwSignal<Option<usize>>,
@@ -450,12 +456,14 @@ pub fn graph_page(
     active: Signal<bool>,
     domains: RwSignal<Domains>,
     ptrs: RwSignal<Ptrs>,
+    shodan: RwSignal<Shodans>,
 ) -> impl IntoView {
     let selected = RwSignal::new(None::<usize>);
     let page = Page {
         graph,
         domains,
         ptrs,
+        shodan,
         layout: Layout {
             graph,
             sim: StoredValue::new(Sim::default()),
@@ -1010,6 +1018,7 @@ impl Page {
                         Signal::derive(move || selected.get().is_some_and(|i| self.pinned(i))),
                         actions,
                     )}
+                    {shodan_section(graph, selected, self.shodan)}
                 </Show>
                 <section class="ontology" aria-label="Ontology">
                     <h3>"Ontology"</h3>
@@ -1281,6 +1290,58 @@ fn node_inspector(
                 </button>
             </div>
         </section>
+    }
+}
+
+/// Shodan data on the selected node, looked up only when the user asks:
+/// the lookup sends the address to Shodan. Private addresses get none.
+fn shodan_section(
+    graph: RwSignal<Graph>,
+    selected: RwSignal<Option<usize>>,
+    shodan: RwSignal<Shodans>,
+) -> impl IntoView {
+    // The selected address, when it is public.
+    let public_ip = move || {
+        let i = selected.get()?;
+        graph.with(|g| {
+            let n = g.nodes.get(i)?;
+            n.scope.is_none().then(|| n.label.parse::<IpAddr>().ok())?
+        })
+    };
+    let asked = RwSignal::new(HashSet::<IpAddr>::new());
+    let body = move || {
+        let ip = public_ip()?;
+        if let Some(list) = shodan.with(|s| s.get(&ip).map(ShodanInfo::facts)) {
+            return Some(facts("facts", list).into_any());
+        }
+        if asked.with(|a| a.contains(&ip)) {
+            return Some(view! { <p class="inspector-note">"Asking Shodan…"</p> }.into_any());
+        }
+        let look_up = move |_| {
+            asked.update(|a| {
+                a.insert(ip);
+            });
+            post_message(&format!("shodan {ip}"));
+        };
+        Some(
+            view! {
+                <p class="inspector-note">"Sends this address to Shodan (internetdb.shodan.io)."</p>
+                <div class="inspector-actions">
+                    <button type="button" class="btn btn-secondary btn-sm" on:click=look_up>
+                        "Look up on Shodan"
+                    </button>
+                </div>
+            }
+            .into_any(),
+        )
+    };
+    view! {
+        <Show when=move || public_ip().is_some()>
+            <section class="inspector" aria-label="Shodan" aria-live="polite">
+                <p class="tip-title">"Shodan"</p>
+                {body}
+            </section>
+        </Show>
     }
 }
 

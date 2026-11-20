@@ -1,6 +1,6 @@
 //! Leptos UI. Runs inside the shell's webview and talks to it only through
 //! `window.ipc.postMessage` (out) and `pkts` / `status` / `domain` /
-//! `ptr` / `notice` / `inspect` / `http` / `mitm` window events (in).
+//! `ptr` / `shodan` / `notice` / `inspect` / `http` / `mitm` window events (in).
 
 mod filters;
 mod graph;
@@ -22,7 +22,7 @@ use graph::graph_page;
 use inspector::{exchange_view, inspector};
 use model::{
     Col, DomainInfo, Domains, Exchange, Filter, Graph, Hosts, Inspection, MitmState, Ptrs, Row,
-    Rules, TableView, table_view,
+    Rules, ShodanInfo, Shodans, TableView, table_view,
 };
 use networks::networks_page;
 use packets::packet_table;
@@ -104,6 +104,8 @@ struct App {
     /// PTR names, and whether to look them up for every address seen.
     ptrs: RwSignal<Ptrs>,
     ptr_on: RwSignal<bool>,
+    /// Shodan answers for the addresses the user looked up.
+    shodan: RwSignal<Shodans>,
     collapse: RwSignal<bool>,
     recent_only: RwSignal<bool>,
     notice: RwSignal<Option<Notice>>,
@@ -162,6 +164,7 @@ impl App {
             domains,
             ptrs: RwSignal::new(Ptrs::new()),
             ptr_on: RwSignal::new(true),
+            shodan: RwSignal::new(Shodans::new()),
             collapse,
             recent_only,
             notice: RwSignal::new(None),
@@ -292,16 +295,26 @@ fn listen_capture(app: &App) {
     });
 }
 
-/// Follows what the shell answers: packet detail, proxy state, decrypted
-/// requests and notices.
+/// Follows what the shell answers: Shodan data, packet detail, proxy
+/// state, decrypted requests and notices.
 fn listen_results(app: &App) {
     let App {
         inspection,
         mitm,
         exchanges,
         notice,
+        shodan,
         ..
     } = *app;
+    window_event_listener_untyped("shodan", move |ev| {
+        if let Some(s) = detail::<ShodanInfo>(ev)
+            && let Ok(ip) = s.ip.parse()
+        {
+            shodan.update(|m| {
+                m.insert(ip, s);
+            });
+        }
+    });
     window_event_listener_untyped("inspect", move |ev| {
         if let Some(i) = detail::<Inspection>(ev) {
             inspection.set(Some(i));
@@ -576,6 +589,7 @@ fn sheet(app: &App, inspect: Callback<u64>) -> impl IntoView + use<> {
         query,
         table,
         sort,
+        shodan,
         ..
     } = *app;
     let show_in_table = Callback::new(move |term: String| {
@@ -601,7 +615,7 @@ fn sheet(app: &App, inspect: Callback<u64>) -> impl IntoView + use<> {
                 aria-labelledby="tab-graph"
                 hidden=move || tab.get() != Tab::Graph
             >
-                {graph_page(graph, Signal::derive(move || tab.get() == Tab::Graph), domains, ptrs)}
+                {graph_page(graph, Signal::derive(move || tab.get() == Tab::Graph), domains, ptrs, shodan)}
             </div>
             <div
                 role="tabpanel"

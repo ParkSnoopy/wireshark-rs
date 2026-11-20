@@ -19,6 +19,7 @@ mod owners;
 mod parse;
 mod ptr;
 mod rdap;
+mod shodan;
 mod stream;
 
 use std::borrow::Cow;
@@ -46,6 +47,7 @@ use mitm::{Exchange, Mitm};
 use names::Names;
 use ptr::{Ptr, PtrInfo};
 use rdap::{DomainInfo, Rdap};
+use shodan::{Shodan, ShodanInfo};
 
 const ORIGIN: &str = "app://localhost/";
 /// How often captured rows are pushed to the UI.
@@ -63,6 +65,8 @@ enum UserEvent {
     Domain(DomainInfo),
     /// Reverse DNS name of an address the UI asked about.
     Ptr(PtrInfo),
+    /// What Shodan knows about an address the user asked about.
+    Shodan(ShodanInfo),
     /// Outcome of a save, shown briefly in the UI.
     Notice(Notice),
     /// Packet detail the UI asked for.
@@ -108,6 +112,7 @@ struct App {
     names: Names,
     rdap: Rdap,
     ptr: Ptr,
+    shodan: Shodan,
     /// HTTPS proxy, while the user has it on.
     mitm: Option<Mitm>,
     /// Open save dialog. GTK drops a native dialog that nothing holds.
@@ -156,6 +161,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Fails only when the event loop is gone, i.e. during exit.
         Ptr::spawn(move |info| drop(proxy.send_event(UserEvent::Ptr(info))))
     };
+    let shodan = {
+        let proxy = event_loop.create_proxy();
+        // Fails only when the event loop is gone, i.e. during exit.
+        Shodan::spawn(move |info| drop(proxy.send_event(UserEvent::Shodan(info))))
+    };
     let mut app = App {
         window,
         webview,
@@ -167,6 +177,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         names: Names::default(),
         rdap,
         ptr,
+        shodan,
         mitm: None,
         dialog: None,
         status: Status {
@@ -181,6 +192,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             Event::UserEvent(UserEvent::Ipc(msg)) => app.handle_ipc(&msg),
             Event::UserEvent(UserEvent::Domain(info)) => emit(&app.webview, "domain", &info),
             Event::UserEvent(UserEvent::Ptr(info)) => emit(&app.webview, "ptr", &info),
+            Event::UserEvent(UserEvent::Shodan(info)) => emit(&app.webview, "shodan", &info),
             Event::UserEvent(UserEvent::Inspect(i)) => emit(&app.webview, "inspect", &i),
             Event::UserEvent(UserEvent::Http(ex)) => emit(&app.webview, "http", &ex),
             Event::UserEvent(UserEvent::Notice(n)) => {
@@ -228,8 +240,15 @@ impl App {
     /// IPC messages from the UI: `hello`, `start <interface>`, `stop`,
     /// `save-pcap`, `save <file name>` with the file contents on the
     /// following lines, `ptr <address>...` for reverse DNS names,
+    /// `shodan <address>` for what Shodan knows about a public address,
     /// `inspect <packet number>`, or `mitm on` / `mitm off`.
     fn handle_ipc(&mut self, msg: &str) {
+        if let Some(addr) = msg.strip_prefix("shodan ") {
+            if let Ok(ip) = addr.trim().parse() {
+                self.shodan.check(ip);
+            }
+            return;
+        }
         if let Some(no) = msg.strip_prefix("inspect ") {
             return self.inspect(no);
         }
